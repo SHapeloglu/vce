@@ -41,7 +41,7 @@
 
 ## Proje Hakkında
 
-Bu proje, **MailSender Pro** e-posta gönderim platformunun MySQL veritabanı için geliştirilmiş tam kapsamlı bir veri kalitesi (Data Quality) sistemidir.
+Bu proje, Cocacolaya yaptığım SAP ERP Source ve Google Big DWH arası verikalitesi projesinde yaptığım çalışmaların birebir aynını örnek olark kedi  **MailSender Pro** e-posta gönderim platformumun MySQL veritabanı için geliştirilmiş tam kapsamlı bir veri kalitesi (Data Quality) sistemidir.
 
 ### Temel Felsefe
 

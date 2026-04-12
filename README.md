@@ -12,6 +12,7 @@
 ## İçindekiler
 
 - [Proje Hakkında](#proje-hakkında)
+- [Schema Mimarisi](#schema-mimarisi)
 - [Mimari](#mimari)
 - [Özellikler](#özellikler)
 - [Klasör Yapısı](#klasör-yapısı)
@@ -19,6 +20,7 @@
   - [Ön Gereksinimler](#ön-gereksinimler)
   - [MySQL Kurulumu](#mysql-kurulumu)
   - [Airflow Kurulumu](#airflow-kurulumu)
+  - [Airflow Connection Tanımları](#airflow-connection-tanımları)
   - [Airflow Variable Tanımları](#airflow-variable-tanımları)
 - [Kullanım](#kullanım)
   - [Yeni Kural Ekleme](#yeni-kural-ekleme)
@@ -31,6 +33,7 @@
   - [TableValidationOperator](#tablevalidationoperator)
   - [RemediationOperator](#remediationoperator)
 - [Veritabanı Şeması](#veritabanı-şeması)
+- [Partition Yönetimi](#partition-yönetimi)
 - [Kural Kataloğu](#kural-kataloğu)
 - [Bildirimler](#bildirimler)
 - [Orijinal VCE ile Farklar](#orijinal-vce-ile-farklar)
@@ -41,7 +44,7 @@
 
 ## Proje Hakkında
 
-Bu proje, Cocacolaya yaptığım SAP ERP Source ve Google Big DWH arası verikalitesi projesinde yaptığım çalışmaların birebir aynını örnek olark kedi  **MailSender Pro** e-posta gönderim platformumun MySQL veritabanı için geliştirilmiş tam kapsamlı bir veri kalitesi (Data Quality) sistemidir.
+Bu proje, **MailSender Pro** e-posta gönderim platformunun MySQL veritabanı için geliştirilmiş tam kapsamlı bir veri kalitesi (Data Quality) sistemidir.
 
 ### Temel Felsefe
 
@@ -64,55 +67,133 @@ Geleneksel veri kalitesi projelerinde her yeni kontrol için Python kodu yazıl�
 | Eski tokenların birikmesi | Nightly remediation DAG'ı |
 | Güvenlik sorunu (brute force) | Audit log'dan otomatik tespit |
 | "Dün gece ne silindi?" sorusu | `vce_remediation_log` tablosu |
+| Kural geçmişi ("2 ay önce ne vardı?") | MySQL trigger ile `vce_rule_audit_log` |
+| Performans (tablo büyümesi) | MySQL aylık partition ile yönetim |
+
+---
+
+## Schema Mimarisi
+
+Bu projenin en önemli tasarım kararı: **iki ayrı MySQL schema, aynı sunucuda, iki ayrı Airflow connection ile yönetilir.**
+
+```
+Aynı MySQL Sunucusu
+├── vce                      ← VCE tabloları (kurallar, sonuçlar, loglar)
+│   ├── vce_dq_rules
+│   ├── vce_dq_executions        (aylık partition)
+│   ├── vce_table_validations
+│   ├── vce_table_val_executions (aylık partition)
+│   ├── vce_rule_audit_log
+│   ├── vce_remediation_log      (aylık partition)
+│   └── vce_anomaly_baselines
+│
+└── aws_mailsender_pro_v3    ← MailSender Pro uygulama tabloları
+    ├── send_log
+    ├── suppression_list
+    ├── senders
+    ├── send_queue
+    ├── users
+    └── ... (diğer uygulama tabloları)
+```
+
+### Neden İki Ayrı Connection?
+
+```
+Tek connection olsaydı:
+  - Hangi schema'da sorgu çalıştığı belirsiz olurdu
+  - Kural SQL'i yanlışlıkla VCE tablosuna, sonuç yanlış schema'ya yazılabilirdi
+  - Yetki yönetimi karmaşıklaşırdı
+
+İki ayrı connection ile:
+  ┌──────────────────────────────────────────────────────────┐
+  │ Conn Id: vce                                             │
+  │ Schema : vce                                             │
+  │ Yetki  : SELECT + INSERT + UPDATE + DELETE → vce.*       │
+  │ Kullanım: VCE tablolarını okur ve yazar                  │
+  └──────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────┐
+  │ Conn Id: mailsender                                      │
+  │ Schema : aws_mailsender_pro_v3                           │
+  │ Yetki  : Yalnızca SELECT (readonly)                      │
+  │ Kullanım: Kural SQL'lerini çalıştırır, veri okur         │
+  └──────────────────────────────────────────────────────────┘
+```
+
+### Operatör İçindeki Bağlantı Akışı
+
+Her operatörde hangi adımın hangi connection'ı kullandığı açıkça ayrılmıştır:
+
+```
+DataQualityOperator çalışınca:
+
+  Adım 1: vce connection
+          → vce.vce_dq_rules'dan kuralları yükle
+
+  Adım 2: mailsender connection
+          → aws_mailsender_pro_v3.send_log üzerinde kural SQL'ini çalıştır
+
+  Adım 3: vce connection
+          → Sonucu vce.vce_dq_executions'a kaydet
+
+  Adım 4: vce connection
+          → Anomali için vce.vce_anomaly_baselines güncelle
+```
 
 ---
 
 ## Mimari
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                   MySQL — Kural & Sonuç Tabloları               │
-│  vce_dq_rules │ vce_dq_executions │ vce_rule_audit_log         │
-│  vce_table_validations │ vce_remediation_log │ vce_anomaly_...  │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ kuralları yükle / sonuçları yaz
-┌──────────────────────────▼──────────────────────────────────────┐
-│              Custom Airflow Operatörleri (BaseOperator)          │
-│  DataQualityOperator │ TableValidationOperator │ RemediationOp.  │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ task olarak çalışır
-┌──────────────────────────▼──────────────────────────────────────┐
-│                    Apache Airflow DAG'ları                        │
-│  mailsender_vce_main (06:00) │ mailsender_vce_remediation (03:00)│
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ bildirim / rapor
-┌──────────────────────────▼──────────────────────────────────────┐
-│            Çıktılar: Teams · Slack · HTML Dashboard · MySQL Log  │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│              MySQL — İKİ AYRI SCHEMA, AYNI SUNUCU                │
+│                                                                   │
+│  ┌─────────────────────────────┐  ┌──────────────────────────┐   │
+│  │  vce (VCE Tabloları)        │  │  aws_mailsender_pro_v3   │   │
+│  │  vce_dq_rules               │  │  send_log                │   │
+│  │  vce_dq_executions [part.]  │  │  suppression_list        │   │
+│  │  vce_rule_audit_log         │  │  senders                 │   │
+│  │  vce_remediation_log [part.]│  │  send_queue              │   │
+│  │  vce_anomaly_baselines      │  │  users                   │   │
+│  └──────────┬──────────────────┘  └──────────┬───────────────┘   │
+└─────────────┼────────────────────────────────┼───────────────────┘
+              │ yazar/okur                      │ sadece okur
+   ┌──────────▼─────────────────────────────────▼──────────────┐
+   │            Custom Airflow Operatörleri (BaseOperator)       │
+   │  get_vce_conn()          get_mailsender_conn()              │
+   │  run_vce_query()         run_mailsender_query()             │
+   │  execute_vce_dml()                                          │
+   └──────────────────────────┬─────────────────────────────────┘
+                              │
+   ┌──────────────────────────▼─────────────────────────────────┐
+   │                   Apache Airflow DAG'ları                    │
+   │  mailsender_vce_main (06:00)                                │
+   │  mailsender_vce_remediation (03:00)                         │
+   └──────────────────────────┬─────────────────────────────────┘
+                              │
+   ┌──────────────────────────▼─────────────────────────────────┐
+   │         Teams · Slack · HTML Dashboard · MySQL Log           │
+   └─────────────────────────────────────────────────────────────┘
 ```
 
 ### Çalışma Akışı
 
 ```
-03:00  mailsender_vce_remediation → süresi dolmuş tokenları sil
-       her işlem vce_remediation_log'a kaydedilir
+03:00  mailsender_vce_remediation
+       mailsender conn → aws_mailsender_pro_v3 tablolarını temizle
+       vce conn        → vce.vce_remediation_log'a yaz
 
-06:00  mailsender_vce_main başlar
+06:00  mailsender_vce_main
   │
-  ├─ dq_schema (şema kontrolü — zorunlu 16 tablo)
+  ├─ dq_schema       vce conn → vce.vce_dq_rules'dan kuralları yükle
+  │                  mailsender conn → information_schema kontrol
   │
-  ├─ [Paralel]
-  │   ├─ dq_security          (kullanıcı, brute force, zombie hesap)
-  │   ├─ dq_send_log          (failed oranı, spam riski, anomali)
-  │   ├─ dq_suppression       (ihlal tespiti, büyüme, domain blacklist)
-  │   ├─ dq_queue             (takılı görev, sayı tutarsızlığı)
-  │   ├─ dq_verify            (verify job durumu)
-  │   ├─ dq_senders           (konfigürasyon kalitesi)
-  │   ├─ dq_integrity         (FK bütünlüğü, duplicate)
-  │   ├─ dq_freshness_volume  (taze veri, hacim kontrolleri)
-  │   └─ tv_send_consistency  (kaynak-hedef karşılaştırma)
+  ├─ [Paralel — her task için aynı akış]
+  │   vce conn        → kuralları yükle
+  │   mailsender conn → kural SQL'ini çalıştır
+  │   vce conn        → sonucu kaydet
   │
-  └─ generate_summary → PASS/WARN/FAIL özeti → Teams/Slack
+  └─ generate_summary → Teams/Slack bildirimi
 ```
 
 ---
@@ -120,11 +201,11 @@ Geleneksel veri kalitesi projelerinde her yeni kontrol için Python kodu yazıl�
 ## Özellikler
 
 ### Kural Yönetimi
-- ✅ Tüm kurallar `vce_dq_rules` tablosunda — kod değişmeden yeni kural eklenir
-- ✅ `active_flag = 0` ile kural devre dışı bırakılır, `non_active_description` ile sebebi yazılır
-- ✅ `test_flag = 1` ile kural test modunda çalışır (aksiyon alınmaz, sadece loglanır)
-- ✅ `execute_time` ile hangi saatteki DAG çalışmasında aktif olduğu belirlenir
-- ✅ `author` ile kimin yazdığı kayıt altında
+- ✅ Tüm kurallar `vce.vce_dq_rules` tablosunda — kod değişmeden kural eklenir
+- ✅ `active_flag = 0` ile kural devre dışı, `non_active_description` ile sebebi kayıtlı
+- ✅ `test_flag = 1` ile kural test modunda (aksiyon yok, sadece log)
+- ✅ `execute_time` ile hangi saatteki DAG çalışmasında aktif
+- ✅ MySQL trigger ile her kural değişikliği `vce_rule_audit_log`'a otomatik kaydedilir
 
 ### Kontrol Tipleri
 
@@ -141,37 +222,40 @@ Geleneksel veri kalitesi projelerinde her yeni kontrol için Python kodu yazıl�
 ### Anomali Tespiti
 - Geçmiş 30 günlük değerler üzerinden ortalama ve standart sapma hesaplanır
 - Z-skoru = `|değer - ortalama| / std`
-- `|Z| > 3` → anomali (güven aralığı dışı)
-- Yetersiz geçmiş verisi (< 7 gün) varsa baseline biriktirilir, anomali sayılmaz
-- Taban değerleri `vce_anomaly_baselines` tablosunda saklanır
+- `|Z| > 3` → anomali (%99.7 güven aralığı dışı)
+- Yetersiz geçmiş (< 7 gün) varsa baseline biriktirilir, anomali sayılmaz
+- Taban değerleri `vce.vce_anomaly_baselines` tablosunda saklanır
 
-### Güvenlik
+### Güvenlik & Yetki Ayrımı
 - SQL injection: tüm sorgularda parametre binding (`%s` placeholder)
 - Webhook URL'leri Airflow Variable'da (hardcoded değil)
-- `airflow_dq` kullanıcısı sadece `SELECT` ve belirli `DELETE` yetkilerine sahip
+- `vce` connection → VCE tablolarına yazar, MailSender'a dokunamaz
+- `mailsender` connection → sadece SELECT, VCE tablolarına dokunamaz
+- Remediation için ayrı DML kullanıcısı (`airflow_ms_dml`)
+
+### Data Retention (MySQL Partitioning)
+- 3 büyüyen tablo aylık RANGE partition ile yönetilir
+- Eski partition'ı düşürmek microsaniye sürer (DELETE'den çok hızlı)
+- Tek tablo görünümü — JOIN/UNION/VIEW gerekmez
+- Sorgu performansı: sadece ilgili ay partition'ı taranır
+
+### Audit Trail
+- `vce_rule_audit_log` MySQL trigger ile otomatik dolar
+- Kural INSERT/UPDATE/DELETE/ACTIVATE/DEACTIVATE olayları kaydedilir
+- `old_sql` / `new_sql` karşılaştırması — tam geçmiş
 
 ### Remediation (Otomatik Temizlik)
 
-Her gece 03:00'da çalışır ve şunları temizler:
+Her gece 03:00'da `aws_mailsender_pro_v3`'ten temizler:
 
-| İşlem | Hedef | Kriter |
-|-------|-------|--------|
-| `delete_expired_tokens` | `password_reset_tokens` | Süresi dolmuş veya kullanılmış, 7+ gün eski |
-| `delete_expired_unsub` | `unsubscribe_tokens` | Kullanılmamış, 30+ gün önce süresi dolmuş |
+| İşlem | Hedef Tablo | Kriter |
+|-------|------------|--------|
+| `delete_expired_tokens` | `password_reset_tokens` | Süresi dolmuş/kullanılmış, 7+ gün eski |
+| `delete_expired_unsub` | `unsubscribe_tokens` | Kullanılmamış, 30+ gün süresi dolmuş |
 | `delete_old_rate_logs` | `rate_limit_log` | 7+ günlük kayıtlar |
 | `delete_old_ses_notif` | `ses_notifications` | 90+ günlük bildirimler |
 
-Her temizlik işlemi `vce_remediation_log` tablosuna kaydedilir.
-
-### Audit Trail
-- Kural değişiklikleri `vce_rule_audit_log` tablosuna yazılır
-- Kim, ne zaman, ne değiştirdi, neden — tam iz
-- `old_sql` / `new_sql` karşılaştırması mevcut
-
-### Bildirimler
-- Microsoft Teams webhook (fail + warn için)
-- Slack webhook (opsiyonel)
-- Airflow Variable üzerinden yapılandırılır
+Her işlem `vce.vce_remediation_log`'a kaydedilir.
 
 ---
 
@@ -179,25 +263,27 @@ Her temizlik işlemi `vce_remediation_log` tablosuna kaydedilir.
 
 ```
 vce_mailsender/
-├── README.md                          # Bu dosya
+├── README.md
 │
 ├── sql/
-│   ├── 01_vce_schema.sql              # VCE tablolarını oluşturur (7 tablo)
-│   └── 02_vce_seed_rules.sql          # Tüm MailSender kurallarını ekler (30+ kural)
+│   ├── 01_vce_schema.sql          # vce schema'daki 7 tabloyu oluşturur
+│   │                              # + MySQL trigger'lar (audit log için)
+│   │                              # + Aylık partition tanımları
+│   └── 02_vce_seed_rules.sql      # 30+ hazır kural (aws_mailsender_pro_v3 prefix'li)
 │
 ├── operators/
-│   └── vce_operators.py               # Custom Airflow operatörleri
-│       ├── VCEBaseOperator            # Ortak metodlar (bağlantı, bildirim, kayıt)
-│       ├── DataQualityOperator        # SQL kural çalıştırıcı
-│       ├── TableValidationOperator    # Kaynak-hedef karşılaştırma
-│       └── RemediationOperator        # Otomatik temizlik
+│   └── vce_operators.py           # Custom Airflow operatörleri
+│       ├── VCEBaseOperator        # İki connection yönetimi + bildirim + kayıt
+│       ├── DataQualityOperator    # Kural SQL çalıştırıcı
+│       ├── TableValidationOperator# Kaynak-hedef karşılaştırma
+│       └── RemediationOperator    # Otomatik temizlik
 │
 ├── dags/
-│   ├── mailsender_vce_main.py         # Ana denetim DAG'ı (her gün 06:00)
-│   └── mailsender_vce_remediation.py  # Temizlik DAG'ı (her gün 03:00)
+│   ├── mailsender_vce_main.py         # Ana denetim DAG'ı (06:00)
+│   └── mailsender_vce_remediation.py  # Temizlik DAG'ı (03:00)
 │
 └── dashboard/
-    └── vce_dashboard.html             # Tek sayfalık HTML dashboard
+    └── vce_dashboard.html         # HTML dashboard (Chart.js)
 ```
 
 ---
@@ -210,71 +296,110 @@ vce_mailsender/
 |---------|-------|-----|
 | Python | 3.9+ | |
 | Apache Airflow | 2.6+ | Docker önerilir |
-| MySQL | 8.0+ | Yerel kurulum |
+| MySQL | 8.0+ | Partition desteği için 8.0 şart |
 | PyMySQL | 1.0+ | `pip install pymysql` |
 
 ### MySQL Kurulumu
 
-#### 1. Airflow kullanıcısı oluştur
+#### 1. VCE schema'sını oluştur
 
 ```sql
--- Yalnızca okuma + belirli DELETE yetkileri
-CREATE USER 'airflow_dq'@'%' IDENTIFIED BY 'GUCLU_BIR_SIFRE';
+CREATE DATABASE IF NOT EXISTS vce
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+```
 
--- MailSender tablolarını okuma yetkisi
-GRANT SELECT ON mailsender.* TO 'airflow_dq'@'%';
+#### 2. MySQL kullanıcılarını oluştur
 
--- VCE tablolarına yazma yetkisi (execution kayıtları için)
-GRANT INSERT ON mailsender.vce_dq_executions        TO 'airflow_dq'@'%';
-GRANT INSERT ON mailsender.vce_table_val_executions  TO 'airflow_dq'@'%';
-GRANT INSERT, UPDATE ON mailsender.vce_anomaly_baselines TO 'airflow_dq'@'%';
-GRANT INSERT ON mailsender.vce_remediation_log       TO 'airflow_dq'@'%';
-GRANT INSERT ON mailsender.vce_rule_audit_log        TO 'airflow_dq'@'%';
+Bu projede üç ayrı MySQL kullanıcısı kullanılır. Her birinin sorumluluğu nettir:
 
--- Remediation için DELETE yetkileri (sadece belirli tablolar)
-GRANT DELETE ON mailsender.password_reset_tokens TO 'airflow_dq'@'%';
-GRANT DELETE ON mailsender.unsubscribe_tokens    TO 'airflow_dq'@'%';
-GRANT DELETE ON mailsender.rate_limit_log        TO 'airflow_dq'@'%';
-GRANT DELETE ON mailsender.ses_notifications     TO 'airflow_dq'@'%';
+```sql
+-- ── Kullanıcı 1: airflow_vce ──────────────────────────────────────────
+-- vce schema'sına tam yetkili — VCE tablolarını okur ve yazar.
+-- Airflow Connection: vce
+CREATE USER 'airflow_vce'@'%' IDENTIFIED BY 'GUCLU_SIFRE_1';
+GRANT SELECT, INSERT, UPDATE, DELETE ON vce.* TO 'airflow_vce'@'%';
+
+-- ── Kullanıcı 2: airflow_ms_readonly ──────────────────────────────────
+-- aws_mailsender_pro_v3 schema'sını sadece okur.
+-- Kural SQL'leri bu kullanıcıyla çalışır — yazma yetkisi kesinlikle yok.
+-- Airflow Connection: mailsender (DataQualityOperator ve TableValidationOperator için)
+CREATE USER 'airflow_ms_readonly'@'%' IDENTIFIED BY 'GUCLU_SIFRE_2';
+GRANT SELECT ON aws_mailsender_pro_v3.* TO 'airflow_ms_readonly'@'%';
+
+-- ── Kullanıcı 3: airflow_ms_dml ───────────────────────────────────────
+-- aws_mailsender_pro_v3'te sadece belirli tablolara DELETE yetkisi.
+-- RemediationOperator bu kullanıcıyla çalışır.
+-- Airflow Connection: mailsender (RemediationOperator için — ayrı bağlantı önerilir)
+CREATE USER 'airflow_ms_dml'@'%' IDENTIFIED BY 'GUCLU_SIFRE_3';
+GRANT SELECT ON aws_mailsender_pro_v3.* TO 'airflow_ms_dml'@'%';
+GRANT DELETE ON aws_mailsender_pro_v3.password_reset_tokens TO 'airflow_ms_dml'@'%';
+GRANT DELETE ON aws_mailsender_pro_v3.unsubscribe_tokens    TO 'airflow_ms_dml'@'%';
+GRANT DELETE ON aws_mailsender_pro_v3.rate_limit_log        TO 'airflow_ms_dml'@'%';
+GRANT DELETE ON aws_mailsender_pro_v3.ses_notifications     TO 'airflow_ms_dml'@'%';
 
 FLUSH PRIVILEGES;
 ```
 
-#### 2. VCE şemasını oluştur
+> **Not:** `airflow_ms_readonly` ve `airflow_ms_dml` için aynı Airflow connection (`mailsender`) kullanılıyorsa DML kullanıcısını tercih edin — SELECT yetkisi zaten içinde. Güvenlik öncelikli ortamlarda iki ayrı connection tanımlanabilir.
+
+#### 3. VCE şemasını ve tablolarını oluştur
 
 ```bash
-mysql -u root -p mailsender < sql/01_vce_schema.sql
+# vce schema'sına bağlanarak SQL'i çalıştır
+mysql -u root -p vce < sql/01_vce_schema.sql
 ```
 
-Bu komut şu 7 tabloyu oluşturur:
+Bu komut şunları oluşturur:
 
-| Tablo | Açıklama |
-|-------|----------|
-| `vce_dq_rules` | Kural tanımları (tek gerçek kaynağı) |
-| `vce_dq_executions` | Her kural çalışmasının sonucu |
-| `vce_table_validations` | Kaynak-hedef karşılaştırma tanımları |
-| `vce_table_val_executions` | Karşılaştırma sonuçları |
-| `vce_rule_audit_log` | Kural değişiklik geçmişi |
-| `vce_remediation_log` | Otomatik temizlik kayıtları |
-| `vce_anomaly_baselines` | Anomali tespiti istatistikleri |
+**7 tablo:**
 
-#### 3. Kuralları yükle
+| Tablo | Partition | Açıklama |
+|-------|-----------|----------|
+| `vce_dq_rules` | — | Kural tanımları |
+| `vce_dq_executions` | ✅ Aylık | Her çalışmanın sonucu |
+| `vce_table_validations` | — | Karşılaştırma tanımları |
+| `vce_table_val_executions` | ✅ Aylık | Karşılaştırma sonuçları |
+| `vce_rule_audit_log` | — | Kural değişiklik geçmişi |
+| `vce_remediation_log` | ✅ Aylık | Temizlik kayıtları |
+| `vce_anomaly_baselines` | — | Anomali istatistikleri |
+
+**3 MySQL trigger** (`vce_dq_rules` için):
+- `trg_vce_rules_after_insert` — yeni kural eklendiğinde
+- `trg_vce_rules_after_update` — kural değiştirildiğinde
+- `trg_vce_rules_after_delete` — kural silindiğinde
+
+#### 4. Kuralları yükle
 
 ```bash
-mysql -u root -p mailsender < sql/02_vce_seed_rules.sql
+# Kurallar aws_mailsender_pro_v3 prefix'li — vce schema'sına yüklenir
+mysql -u root -p vce < sql/02_vce_seed_rules.sql
 ```
 
-30'dan fazla hazır kural yüklenir. Yüklenen kuralları doğrulamak için:
+Yüklemeyi doğrula:
 
 ```sql
-SELECT rule_domain, rule_subdomain, check_type, action, active_flag
+USE vce;
+
+-- Kural sayısı domain bazlı
+SELECT rule_domain, COUNT(*) as kural_sayisi,
+       SUM(active_flag) as aktif
 FROM vce_dq_rules
-ORDER BY rule_domain, rule_subdomain;
+GROUP BY rule_domain
+ORDER BY rule_domain;
+
+-- Trigger'lar oluştu mu?
+SHOW TRIGGERS FROM vce;
+
+-- Partition'lar oluştu mu?
+SELECT PARTITION_NAME, TABLE_ROWS
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'vce'
+  AND TABLE_NAME = 'vce_dq_executions'
+ORDER BY PARTITION_ORDINAL_POSITION;
 ```
 
-#### 4. MySQL bind-address kontrolü (Docker için)
-
-Airflow Docker container'ının host MySQL'e erişebilmesi için:
+#### 5. MySQL bind-address (Docker için)
 
 ```ini
 # /etc/mysql/mysql.conf.d/mysqld.cnf
@@ -288,9 +413,7 @@ sudo systemctl restart mysql
 
 ### Airflow Kurulumu
 
-#### 1. docker-compose.yml güncelle
-
-Docker içindeki Airflow'un host MySQL'e erişmesi için `extra_hosts` ekle:
+#### 1. docker-compose.yml
 
 ```yaml
 services:
@@ -306,39 +429,56 @@ services:
     environment:
       _PIP_ADDITIONAL_REQUIREMENTS: "pymysql"
 
-  airflow-worker:          # varsa
+  airflow-worker:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
       _PIP_ADDITIONAL_REQUIREMENTS: "pymysql"
 ```
 
-> **Not:** Linux'ta `host-gateway` Docker'ın host IP'sini otomatik çözer. Mac/Windows'ta `host.docker.internal` zaten varsayılan tanımlıdır.
-
 #### 2. DAG dosyalarını kopyala
 
 ```bash
-# operators klasörünü dags altına taşı
 cp -r operators/ /path/to/airflow/dags/operators/
-
-# DAG dosyalarını kopyala
 cp dags/mailsender_vce_main.py         /path/to/airflow/dags/
 cp dags/mailsender_vce_remediation.py  /path/to/airflow/dags/
 ```
 
-#### 3. Airflow Connection ekle
+### Airflow Connection Tanımları
 
 **Airflow UI → Admin → Connections → +**
 
+Bu projede **iki ayrı connection** tanımlanmalıdır:
+
+#### Connection 1: `vce`
+
 | Alan | Değer |
 |------|-------|
-| Conn Id | `mailsender_mysql` |
+| Conn Id | `vce` |
 | Conn Type | `Generic` |
 | Host | `host.docker.internal` |
-| Schema | `mailsender` |
-| Login | `airflow_dq` |
-| Password | (oluşturduğunuz şifre) |
+| Schema | `vce` |
+| Login | `airflow_vce` |
+| Password | GUCLU_SIFRE_1 |
 | Port | `3306` |
+
+Bu connection VCE tablolarını okumak ve yazmak için kullanılır.
+
+#### Connection 2: `mailsender`
+
+| Alan | Değer |
+|------|-------|
+| Conn Id | `mailsender` |
+| Conn Type | `Generic` |
+| Host | `host.docker.internal` |
+| Schema | `aws_mailsender_pro_v3` |
+| Login | `airflow_ms_dml` |
+| Password | GUCLU_SIFRE_3 |
+| Port | `3306` |
+
+Bu connection kural SQL'lerini çalıştırmak ve remediation için kullanılır.
+
+> **Neden `airflow_ms_dml`?** Readonly kullanıcı kural SQL'lerini çalıştırabilir ama RemediationOperator DELETE yapamaz. DML kullanıcısı her ikisini de karşılar. Daha katı güvenlik için iki ayrı connection (`mailsender_ro` / `mailsender_dml`) oluşturabilirsiniz.
 
 ### Airflow Variable Tanımları
 
@@ -349,221 +489,153 @@ cp dags/mailsender_vce_remediation.py  /path/to/airflow/dags/
 | `VCE_TEAMS_WEBHOOK_URL` | Teams Incoming Webhook URL | Opsiyonel |
 | `VCE_SLACK_WEBHOOK_URL` | Slack Incoming Webhook URL | Opsiyonel |
 
-Teams webhook URL almak için:
-**Teams → Kanal → Bağlayıcılar → Incoming Webhook → Yapılandır**
-
 ---
 
 ## Kullanım
 
 ### Yeni Kural Ekleme
 
-Kod değişikliği gerekmez. Doğrudan tabloya INSERT yeterlidir:
+Kod değişikliği gerekmez. `vce` schema'sına INSERT yeterlidir:
 
 ```sql
+USE vce;
+
 INSERT INTO vce_dq_rules (
-    rule_domain,
-    rule_subdomain,
-    dataset_name,
-    table_name,
-    check_type,
-    sql_statement,
-    action,
-    description,
-    execute_time,
-    active_flag,
-    author
+    rule_domain, rule_subdomain,
+    dataset_name, table_name,
+    check_type, sql_statement,
+    action, description,
+    execute_time, active_flag, author
 ) VALUES (
-    'send_log',                           -- domain grubu
-    'my_custom_check',                    -- alt kategori
-    'mailsender',                         -- veritabanı
-    'send_log',                           -- tablo
-    'threshold',                          -- kontrol tipi
-    -- SQL: sonucu > 0 ise ihlal
-    'SELECT COUNT(*) FROM send_log
+    'send_log', 'my_custom_check',
+    'aws_mailsender_pro_v3', 'send_log',
+    'threshold',
+    -- ÖNEMLI: Schema prefix zorunlu — aws_mailsender_pro_v3.tablo_adi
+    'SELECT COUNT(*) FROM aws_mailsender_pro_v3.send_log
      WHERE status = ''failed''
        AND error_msg LIKE ''%timeout%''
        AND sent_at >= NOW() - INTERVAL 1 HOUR',
-    'warn',                               -- fail veya warn
-    'Son 1 saatte timeout nedeniyle başarısız olan gönderim sayısını kontrol eder.
-     Yüksek timeout sayısı SMTP sunucusu sorununu işaret edebilir.',
-    '06:00',                              -- hangi DAG çalışmasında aktif
-    1,                                    -- aktif
-    'senin_adin'
+    'warn',
+    'Son 1 saatte timeout nedeniyle başarısız gönderim sayısını kontrol eder.',
+    '06:00', 1, 'senin_adin'
 );
 ```
 
+> **Kritik:** Kural SQL'lerinde tüm tablo referansları `aws_mailsender_pro_v3.tablo_adi` formatında olmalıdır. Aksi halde sorgu `vce` schema'sında çalışır ve tablo bulunamaz.
+
+INSERT sonrasında trigger otomatik `vce_rule_audit_log`'a yazar — audit kaydı için ekstra işlem gerekmez.
+
 ### Kural Tipleri
 
-#### threshold (en yaygın)
-
-SQL sonucu `> 0` ise ihlal. SQL her zaman sayısal bir değer döndürmelidir.
+#### threshold
 
 ```sql
--- ✅ Doğru: COUNT döndürüyor
-SELECT COUNT(*) FROM send_log WHERE recipient IS NULL
-
--- ✅ Doğru: CASE ile kontrol
-SELECT CASE WHEN COUNT(*) > 100 THEN COUNT(*) - 100 ELSE 0 END
-FROM suppression_list WHERE DATE(created_at) = CURDATE()
-
--- ❌ Yanlış: Çok satır döndürüyor
-SELECT * FROM send_log WHERE status = 'failed'
+-- SQL COUNT döndürmeli, sonuç > 0 ise ihlal
+SELECT COUNT(*)
+FROM aws_mailsender_pro_v3.send_log
+WHERE recipient IS NULL
 ```
 
-#### anomaly (dinamik eşik)
-
-Geçmiş 30 günlük değerlere göre istatistiksel sapma tespiti.
-SQL **tek bir sayısal değer** döndürmeli:
+#### anomaly
 
 ```sql
--- Bugünkü failed sayısı — geçmiş 30 güne göre anormal mı?
+-- Tek sayısal değer döndürmeli — geçmişe göre Z-skoru hesaplanır
 SELECT COUNT(*)
-FROM send_log
+FROM aws_mailsender_pro_v3.send_log
 WHERE status = 'failed'
   AND DATE(sent_at) = CURDATE()
 ```
 
-`anomaly_threshold` alanı ile hassasiyet ayarlanabilir (varsayılan: 3.0).
-`2.0` → daha hassas, `4.0` → daha az hassas.
-
 #### freshness
 
-Tablonun belirli sürede güncellenip güncellenmediğini kontrol eder:
-
 ```sql
--- send_log'a son 24 saatte kayıt eklendiyse 0, eklenmediyse 1 döner
+-- 0 = taze, 1 = bayat (ihlal)
 SELECT CASE
     WHEN MAX(sent_at) < NOW() - INTERVAL 24 HOUR OR MAX(sent_at) IS NULL
     THEN 1 ELSE 0
-END FROM send_log
+END
+FROM aws_mailsender_pro_v3.send_log
 ```
 
 #### pre_sql_statement kullanımı
 
-Asıl kontrolden önce hazırlık işlemi gerekiyorsa:
-
 ```sql
--- pre_sql: geçici tablo oluştur
-CREATE TEMPORARY TABLE IF NOT EXISTS tmp_today_stats AS
+-- pre_sql (mailsender connection üzerinde çalışır):
+CREATE TEMPORARY TABLE IF NOT EXISTS tmp_stats AS
 SELECT sender_id, COUNT(*) as total, SUM(status='failed') as fails
-FROM send_log
+FROM aws_mailsender_pro_v3.send_log
 WHERE DATE(sent_at) = CURDATE()
 GROUP BY sender_id;
 
--- sql: geçici tablodan kontrol
-SELECT COUNT(*) FROM tmp_today_stats
+-- sql (aynı mailsender connection, aynı session):
+SELECT COUNT(*) FROM tmp_stats
 WHERE fails / NULLIF(total, 0) > 0.5 AND total >= 10
 ```
 
 ### Anomali Tespiti
 
-Anomali sistemi şu şekilde çalışır:
-
 ```
-1. DAG çalışır → SQL çalıştırılır → sonuç alınır (ör: 145 failed)
+Örnek: send_log/failed_ratio_anomaly kuralı
 
-2. vce_dq_executions'dan son 30 günün değerleri çekilir
-   [120, 98, 134, 87, 156, 112, 103, ...]
-
-3. İstatistik hesaplanır:
-   mean = 113.2, std = 21.4
-
-4. Z-skoru: |145 - 113.2| / 21.4 = 1.49
-
-5. |1.49| < 3.0 (eşik) → Normal ✅
-
-6. Eğer bugün 280 failed olsaydı:
-   |280 - 113.2| / 21.4 = 7.79 → ANOMALİ ⚠️
+1. mailsender conn → SQL çalışır: bugün 280 failed
+2. vce conn → son 30 günlük geçmiş: [120, 98, 134, 87, 156, 112, 103...]
+3. mean=113.2, std=21.4
+4. Z = |280 - 113.2| / 21.4 = 7.79
+5. 7.79 > 3.0 (eşik) → ANOMALİ → warn_checks'e eklenir
+6. vce conn → vce_dq_executions'a yazar: z_score=7.79
 ```
-
-**Yeterli geçmiş yoksa (< 7 gün):** Sistem bu durumu fark eder,
-sadece veriyi biriktirir ve anomali tetiklemez.
 
 ### DAG'ları Çalıştırma
 
-**Otomatik:** DAG'lar schedule'a göre çalışır (03:00 ve 06:00 UTC).
-
-**Manuel tetikleme:**
 ```bash
-# Airflow CLI
+# Manuel tetikleme
 airflow dags trigger mailsender_vce_main
 airflow dags trigger mailsender_vce_remediation
-
-# Belirli bir domain için
-airflow dags trigger mailsender_vce_main \
-  --conf '{"domain": "suppression"}'
 ```
 
-**Airflow UI'dan:** DAG sayfasında ▶ butonu.
-
-**Sonuçları sorgulama:**
+**Sonuçları sorgulama (`vce` schema'sında):**
 
 ```sql
+USE vce;
+
 -- Bugünkü kontrol özeti
-SELECT rule_domain, rule_subdomain, result_status, result_value
+SELECT rule_domain, rule_subdomain, result_status, result_value, run_date
 FROM vce_dq_executions
 WHERE DATE(run_date) = CURDATE()
 ORDER BY result_status DESC, rule_domain;
 
--- Son 7 günlük trend
-SELECT DATE(run_date) as gun,
-       SUM(result_status='Passed') as gecti,
-       SUM(result_status='Failed') as basarisiz
+-- Bir kuralın geçmiş trendi
+SELECT DATE(run_date) as gun, result_value, result_status, z_score
 FROM vce_dq_executions
-WHERE run_date >= NOW() - INTERVAL 7 DAY
-GROUP BY DATE(run_date)
-ORDER BY gun;
+WHERE rule_domain = 'send_log'
+  AND rule_subdomain = 'failed_ratio_threshold'
+  AND run_date >= NOW() - INTERVAL 30 DAY
+ORDER BY run_date;
 
--- Anomali geçmişi
-SELECT rule_domain, rule_subdomain, result_value,
-       baseline_mean, z_score, run_date
-FROM vce_dq_executions
-WHERE check_type = 'anomaly' AND z_score IS NOT NULL
-ORDER BY ABS(z_score) DESC
-LIMIT 20;
+-- Kural değişiklik geçmişi (trigger otomatik doldurdu)
+SELECT change_type, changed_by, changed_at,
+       LEFT(old_sql, 100) as eski_sql,
+       LEFT(new_sql, 100) as yeni_sql
+FROM vce_rule_audit_log
+WHERE rule_domain = 'send_log'
+ORDER BY changed_at DESC;
+
+-- Dün gece ne silindi?
+SELECT operation_type, target_table, rows_affected, result_status, executed_at
+FROM vce_remediation_log
+WHERE DATE(executed_at) = CURDATE() - INTERVAL 1 DAY
+ORDER BY executed_at;
 ```
 
 ---
 
 ## Dashboard
 
-`dashboard/vce_dashboard.html` dosyası tarayıcıda doğrudan açılabilir.
+`dashboard/vce_dashboard.html` tarayıcıda doğrudan açılır.
 
-### Özellikler
+Özellikler: son 24h PASS/WARN/FAIL sayıları, domain tile'ları, 7 günlük trend grafikleri, anomali Z-skoru tablosu, temizlik logları, JSON export.
 
-- **Genel Bakış:** Son 24h PASS/WARN/FAIL sayıları, domain tile'ları
-- **Trend Grafiği:** Son 7 günlük durum değişimi (Chart.js)
-- **Detay Loglar:** Domain ve durum filtresi ile tüm kontrol sonuçları
-- **Anomali Tablosu:** Z-skoru geçmişi
-- **Temizlik Logları:** Remediation geçmişi
-- **JSON Export:** Raporu JSON olarak indir
-
-### Üretim Entegrasyonu
-
-Dashboard şu an demo veri veya manuel JSON ile çalışır.
-Gerçek verilerle beslemek için küçük bir API servisi gerekir:
-
-```python
-# Örnek: Flask ile basit API endpoint
-from flask import Flask, jsonify
-import pymysql
-
-app = Flask(__name__)
-
-@app.route('/api/vce/executions')
-def get_executions():
-    conn = pymysql.connect(...)
-    with conn.cursor(pymysql.cursors.DictCursor) as cur:
-        cur.execute("""
-            SELECT rule_domain, rule_subdomain, check_type, action,
-                   result_value, result_status, z_score, baseline_mean, run_date
-            FROM vce_dq_executions
-            WHERE run_date >= NOW() - INTERVAL 7 DAY
-            ORDER BY run_date DESC
-        """)
-        return jsonify({"executions": cur.fetchall()})
-```
+Üretim entegrasyonu için `vce` schema'sından JSON servisi yapan bir Flask/FastAPI endpoint'i önerilir.
 
 ---
 
@@ -571,437 +643,375 @@ def get_executions():
 
 ### DataQualityOperator
 
-SQL tabanlı kuralları `vce_dq_rules` tablosundan yükler ve çalıştırır.
-
 ```python
 from operators.vce_operators import DataQualityOperator
 
-# Belirli bir domain
 task = DataQualityOperator(
     task_id="check_send_log",
-    rule_domain="send_log",        # Zorunlu: hangi domain
-    rule_subdomain=None,           # Opsiyonel: belirli bir subdomain
-    execute_time="06:00",          # Opsiyonel: hangi saatteki kurallar
-)
-
-# Belirli bir kural
-task = DataQualityOperator(
-    task_id="check_failed_ratio",
-    rule_domain="send_log",
-    rule_subdomain="failed_ratio_threshold",
+    rule_domain="send_log",       # vce.vce_dq_rules'dan bu domain yüklenir
+    rule_subdomain=None,          # None ise tüm subdomain'ler
+    execute_time="06:00",         # Bu saatteki kurallar filtrelenir
 )
 ```
 
-**Parametre Referansı:**
+**Bağlantı akışı:**
 
-| Parametre | Tip | Varsayılan | Açıklama |
-|-----------|-----|-----------|----------|
-| `rule_domain` | str | Zorunlu | Kural grubu (ör: `send_log`) |
-| `rule_subdomain` | str | None | Alt grup filtresi |
-| `execute_time` | str | None | Saat filtresi (ör: `06:00`) |
-
-**Çalışma mantığı:**
-
-1. `vce_dq_rules`'dan aktif kuralları yükler
-2. Her kural için `pre_sql` varsa çalıştırır
-3. `sql_statement` çalıştırır
-4. `check_type='anomaly'` ise Z-skoru hesaplar
-5. İhlal varsa `action` değerine göre `fail_checks` veya `warn_checks`'e ekler
-6. `test_flag=1` ise aksiyon almaz, sadece loglar
-7. Sonucu `vce_dq_executions`'a kaydeder
-8. `fail_checks` doluysa `AirflowException` fırlatır
+```
+vce conn        → vce.vce_dq_rules'dan kuralları yükle
+mailsender conn → aws_mailsender_pro_v3 üzerinde kural SQL'ini çalıştır
+vce conn        → vce.vce_dq_executions'a sonucu yaz
+vce conn        → vce.vce_anomaly_baselines'ı güncelle (anomaly tipi için)
+```
 
 ### TableValidationOperator
-
-Kaynak ve hedef sorguların sonuçlarını karşılaştırır.
 
 ```python
 from operators.vce_operators import TableValidationOperator
 
 task = TableValidationOperator(
-    task_id="validate_send_consistency",
+    task_id="validate_consistency",
     validation_domain="send_consistency",
-    validation_subdomain=None,   # Opsiyonel
 )
 ```
 
-**Karşılaştırma Tipleri:**
-
-| Tip | Açıklama | Kullanım |
-|-----|----------|----------|
-| `exact` | Satırlar birebir eşleşmeli | Küçük referans tablolar |
-| `count` | Satır sayıları eşit olmalı | Büyük tablolar, kaba kontrol |
-| `sum` | Sayısal toplamlar eşit olmalı | Finansal/metrik kontroller |
-| `tolerance` | Yüzde fark izin verilen aralıkta olmalı | Yaklaşık eşleşme |
-
-**Örnek kural tanımı (`vce_table_validations`):**
+**Örnek kural tanımı (`vce.vce_table_validations`):**
 
 ```sql
-INSERT INTO vce_table_validations (
+INSERT INTO vce.vce_table_validations (
     validation_domain, validation_subdomain,
     source_conn_id, source_dataset, source_table,
     source_sql,
     target_conn_id, target_dataset, target_table,
     target_sql,
-    comparison_type, tolerance_pct,
-    action, description, active_flag, author
+    comparison_type, tolerance_pct, action, description, active_flag, author
 ) VALUES (
     'send_consistency', 'queue_vs_log',
-    'mailsender_mysql', 'mailsender', 'send_queue',
-    'SELECT sent_count FROM send_queue WHERE status = ''done'' ORDER BY id',
-    'mailsender_mysql', 'mailsender', 'send_queue_log',
-    'SELECT queue_id, COUNT(*) FROM send_queue_log
+    'mailsender', 'aws_mailsender_pro_v3', 'send_queue',
+    'SELECT id, sent_count FROM aws_mailsender_pro_v3.send_queue
+     WHERE status = ''done'' ORDER BY id',
+    'mailsender', 'aws_mailsender_pro_v3', 'send_queue_log',
+    'SELECT queue_id, COUNT(*) FROM aws_mailsender_pro_v3.send_queue_log
      WHERE status=''sent'' GROUP BY queue_id ORDER BY queue_id',
-    'tolerance', 2.0,
-    'warn',
-    'Tamamlanmış queue görevlerindeki sent_count ile send_queue_log kayıt sayısının
-     %2 toleransla eşit olup olmadığını kontrol eder.',
+    'tolerance', 2.0, 'warn',
+    'Queue sent_count ile send_queue_log satır sayısını %2 toleransla karşılaştırır.',
     1, 'data-team'
 );
 ```
 
-### RemediationOperator
+**Karşılaştırma tipleri:**
 
-Güvenli DELETE işlemleri yapar ve her işlemi loglar.
+| Tip | Açıklama |
+|-----|----------|
+| `exact` | Satırlar birebir eşleşmeli |
+| `count` | Satır sayıları eşit olmalı |
+| `sum` | Sayısal toplamlar eşit olmalı |
+| `tolerance` | Yüzde fark izin verilen aralıkta |
+
+### RemediationOperator
 
 ```python
 from operators.vce_operators import RemediationOperator
 
-# Tüm tanımlı işlemleri çalıştır
 task = RemediationOperator(
-    task_id="run_all",
-    operations=["all"],
-)
-
-# Belirli işlemleri çalıştır
-task = RemediationOperator(
-    task_id="cleanup_tokens",
-    operations=[
-        "delete_expired_tokens",
-        "delete_expired_unsub",
-    ],
+    task_id="cleanup",
+    operations=["all"],   # veya ['delete_expired_tokens', 'delete_old_rate_logs']
 )
 ```
 
-**Yeni temizlik işlemi eklemek:**
+**Bağlantı akışı:**
 
-`vce_operators.py` içindeki `OPERATIONS` dict'ine ekle:
-
-```python
-OPERATIONS = {
-    # ... mevcut işlemler ...
-    "delete_old_audit_logs": {
-        "sql": "DELETE FROM audit_log WHERE created_at < NOW() - INTERVAL 180 DAY",
-        "table": "audit_log",
-        "description": "180+ günlük audit logları temizlendi.",
-    },
-}
+```
+mailsender conn → aws_mailsender_pro_v3'te DELETE çalıştır
+vce conn        → vce.vce_remediation_log'a sonucu yaz
 ```
 
 ---
 
 ## Veritabanı Şeması
 
-### vce_dq_rules (Ana kural tablosu)
+Tüm VCE tabloları `vce` schema'sındadır. Tablo SQL'lerindeki referanslar `aws_mailsender_pro_v3.tablo` formatındadır.
+
+### vce.vce_dq_rules
 
 ```
-id                  INT PK AUTO_INCREMENT
-rule_domain         VARCHAR(100) NOT NULL      -- Gruplama: send_log, security...
-rule_subdomain      VARCHAR(100) NOT NULL      -- Alt grup: failed_ratio, null_check...
-dataset_name        VARCHAR(100)               -- Bilgi amaçlı
-table_name          VARCHAR(200)               -- Bilgi amaçlı
-check_type          ENUM(threshold|anomaly|freshness|volume|schema|duplicate|custom)
-sql_statement       TEXT NOT NULL              -- Çalışacak SQL (COUNT döndürmeli)
-pre_sql_statement   TEXT                       -- Hazırlık SQL (opsiyonel)
-action              ENUM(fail|warn)
-description         TEXT NOT NULL              -- Kapsamlı açıklama
-anomaly_threshold   DECIMAL(10,4)              -- Z-skoru eşiği (varsayılan: 3.0)
-execute_time        VARCHAR(10)                -- Saat filtresi: '06:00'
-active_flag         TINYINT(1) DEFAULT 1       -- 0: devre dışı
-author              VARCHAR(100)
-test_flag           TINYINT(1) DEFAULT 0       -- 1: aksiyon alma, sadece logla
-non_active_description TEXT                   -- Neden kapatıldı?
-insert_timestamp    DATETIME
-update_timestamp    DATETIME
+id, rule_domain, rule_subdomain
+dataset_name, table_name
+check_type: threshold|anomaly|freshness|volume|schema|duplicate|custom
+sql_statement TEXT        ← aws_mailsender_pro_v3.tablo formatında
+pre_sql_statement TEXT
+action: fail|warn
+description TEXT
+anomaly_threshold DECIMAL
+execute_time VARCHAR(10)
+active_flag, author, test_flag, non_active_description
+insert_timestamp, update_timestamp
 ```
 
-### vce_dq_executions (Sonuç tablosu)
+### vce.vce_dq_executions (Aylık Partition)
 
 ```
-id                  BIGINT PK
-rule_id             INT                        -- vce_dq_rules.id
-rule_domain         VARCHAR(100)
-rule_subdomain      VARCHAR(100)
-dag_id              VARCHAR(200)
-dag_run             VARCHAR(500)
-sql_statement       TEXT                       -- Çalışan SQL snapshot
-action              VARCHAR(10)
-result_value        DECIMAL(20,4)              -- SQL sonucu
-result_status       ENUM(Passed|Failed|Skipped|Error)
-error_detail        TEXT
-baseline_mean       DECIMAL(20,4)              -- Anomali: geçmiş ortalama
-baseline_std        DECIMAL(20,4)              -- Anomali: standart sapma
-z_score             DECIMAL(10,4)              -- Anomali: hesaplanan Z
-run_date            DATETIME
+id BIGINT, run_date DATETIME    ← PRIMARY KEY (id, run_date) — partition zorunluluğu
+rule_id, rule_domain, rule_subdomain
+dag_id, dag_task_name, dag_run
+sql_statement, action
+result_value DECIMAL, result_status: Passed|Failed|Skipped|Error
+baseline_mean, baseline_std, z_score    ← anomaly için
 ```
 
-### vce_rule_audit_log (Değişiklik geçmişi)
+### vce.vce_rule_audit_log
 
 ```
-id              BIGINT PK
-rule_id         INT
-change_type     ENUM(INSERT|UPDATE|DELETE|ACTIVATE|DEACTIVATE)
-old_sql         TEXT                           -- Önceki SQL
-new_sql         TEXT                           -- Sonraki SQL
-old_action      VARCHAR(10)
-new_action      VARCHAR(10)
-changed_by      VARCHAR(100)
-change_reason   TEXT
-changed_at      DATETIME
+id, rule_id, rule_domain, rule_subdomain
+change_type: INSERT|UPDATE|DELETE|ACTIVATE|DEACTIVATE
+old_sql, new_sql
+old_action, new_action
+old_active_flag, new_active_flag
+changed_by VARCHAR(100)    ← CURRENT_USER() — trigger doldurur
+change_reason, changed_at
 ```
 
-### vce_remediation_log (Temizlik kayıtları)
+### vce.vce_remediation_log (Aylık Partition)
 
 ```
-id              BIGINT PK
-dag_id          VARCHAR(200)
-operation_type  ENUM(delete_expired_tokens|delete_old_rate_logs|...)
-target_table    VARCHAR(200)
-sql_executed    TEXT
-rows_affected   INT
-result_status   ENUM(Success|Failed|Warning)
-result_detail   TEXT
-executed_at     DATETIME
+id BIGINT, executed_at DATETIME    ← PRIMARY KEY (id, executed_at)
+dag_id, dag_run, task_name
+operation_type ENUM
+target_table VARCHAR(200)    ← aws_mailsender_pro_v3.tablo formatında
+sql_executed, rows_affected
+result_status: Success|Failed|Warning
+result_detail
 ```
+
+---
+
+## Partition Yönetimi
+
+Üç tablo aylık RANGE partition kullanır. Airflow DAG'ı (gelecekte eklenecek `partition_manager`) bunları otomatik yönetir. Manuel müdahale için:
+
+```sql
+USE vce;
+
+-- Mevcut partition'ları listele
+SELECT PARTITION_NAME,
+       TABLE_ROWS,
+       ROUND(DATA_LENGTH/1024/1024, 2) as data_mb,
+       ROUND(INDEX_LENGTH/1024/1024, 2) as index_mb
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'vce'
+  AND TABLE_NAME = 'vce_dq_executions'
+ORDER BY PARTITION_ORDINAL_POSITION;
+
+-- Yeni ay partition'ı ekle (p_future'ı reorganize et)
+ALTER TABLE vce_dq_executions
+REORGANIZE PARTITION p_future INTO (
+    PARTITION p2027_01 VALUES LESS THAN (TO_DAYS('2027-02-01')),
+    PARTITION p_future  VALUES LESS THAN MAXVALUE
+);
+
+-- Aynı işlemi diğer tablolar için tekrarla
+ALTER TABLE vce_table_val_executions
+REORGANIZE PARTITION p_future INTO (
+    PARTITION p2027_01 VALUES LESS THAN (TO_DAYS('2027-02-01')),
+    PARTITION p_future  VALUES LESS THAN MAXVALUE
+);
+
+ALTER TABLE vce_remediation_log
+REORGANIZE PARTITION p_future INTO (
+    PARTITION p2027_01 VALUES LESS THAN (TO_DAYS('2027-02-01')),
+    PARTITION p_future  VALUES LESS THAN MAXVALUE
+);
+
+-- Partition içindeki veriyi kontrol et (silmeden önce!)
+SELECT COUNT(*) FROM vce_dq_executions PARTITION (p2026_01);
+
+-- Eski partition'ı düşür (VERİ SİLİNİR, GERİ ALINAMAZ)
+ALTER TABLE vce_dq_executions        DROP PARTITION p2026_01;
+ALTER TABLE vce_table_val_executions DROP PARTITION p2026_01;
+ALTER TABLE vce_remediation_log      DROP PARTITION p2026_01;
+```
+
+**Partition olmayan tablolar ve neden:**
+
+| Tablo | Neden Partition Yok |
+|-------|---------------------|
+| `vce_dq_rules` | Sabit boyut, 200 kural = 200 satır |
+| `vce_table_validations` | Sabit boyut |
+| `vce_rule_audit_log` | Haftada 2-3 satır, tüm geçmiş erişilebilir kalmalı |
+| `vce_anomaly_baselines` | Kural başına 1 satır, üzerine yazılır, büyümez |
 
 ---
 
 ## Kural Kataloğu
 
-Seed dosyasıyla yüklenen 30+ hazır kural:
+Seed dosyasıyla yüklenen 30+ hazır kural. Tüm SQL'ler `aws_mailsender_pro_v3.` prefix'lidir.
 
 ### Güvenlik (4 kural)
 
-| Kural | Tip | Aksiyon | Açıklama |
-|-------|-----|---------|----------|
-| `no_active_admin` | threshold | fail | Aktif admin kullanıcısı yok |
-| `brute_force_detection` | threshold | warn | 1 saatte 50+ başarısız login |
-| `orphan_reset_tokens` | threshold | warn | 1000+ süresi dolmuş token |
-| `inactive_users_with_access` | threshold | warn | 90+ gün login olmamış aktif hesaplar |
+| Kural | Tip | Aksiyon |
+|-------|-----|---------|
+| `no_active_admin` | threshold | fail |
+| `brute_force_detection` | threshold | warn |
+| `orphan_reset_tokens` | threshold | warn |
+| `inactive_users_with_access` | threshold | warn |
 
 ### Gönderim Logu (6 kural)
 
-| Kural | Tip | Aksiyon | Açıklama |
-|-------|-----|---------|----------|
-| `failed_ratio_threshold` | threshold | fail | Failed oranı > %30 |
-| `failed_ratio_anomaly` | anomaly | warn | Failed sayısı istatistiksel anomali |
-| `null_critical_fields` | threshold | fail | recipient/status/sender_id NULL |
-| `spam_risk_same_recipient` | threshold | warn | 1 saatte aynı adrese 10+ gönderim |
-| `daily_volume` | anomaly | warn | Günlük hacim anormal |
-| `freshness` | freshness | warn | 24 saattir kayıt yok |
+| Kural | Tip | Aksiyon |
+|-------|-----|---------|
+| `failed_ratio_threshold` | threshold | fail |
+| `failed_ratio_anomaly` | anomaly | warn |
+| `null_critical_fields` | threshold | fail |
+| `spam_risk_same_recipient` | threshold | warn |
+| `daily_volume` | anomaly | warn |
+| `freshness` | freshness | warn |
 
 ### Suppression (4 kural)
 
-| Kural | Tip | Aksiyon | Açıklama |
-|-------|-----|---------|----------|
-| `violation_critical` | threshold | **fail** | Suppressed adrese gönderim yapılmış |
-| `daily_growth_anomaly` | anomaly | warn | Günlük suppression artışı anormal |
-| `unsubscribe_integrity` | threshold | warn | Unsubscribe token var ama suppression yok |
-| `domain_blacklist_check` | threshold | **fail** | Blacklist domain'e gönderim |
+| Kural | Tip | Aksiyon |
+|-------|-----|---------|
+| `violation_critical` | threshold | **fail** |
+| `domain_blacklist_check` | threshold | **fail** |
+| `daily_growth_anomaly` | anomaly | warn |
+| `unsubscribe_integrity` | threshold | warn |
 
-### Queue (5 kural)
+### Queue, Verify, Sender, Integrity, Freshness/Volume
 
-| Kural | Tip | Aksiyon | Açıklama |
-|-------|-----|---------|----------|
-| `stuck_running` | threshold | warn | 6+ saattir takılı görev |
-| `count_inconsistency` | threshold | fail | total ≠ sent + failed + skipped |
-| `overdue_pending` | threshold | warn | 30+ dk geçmiş pending görev |
-| `ab_ratio_invalid` | threshold | fail | A/B ratio 0-100 dışı |
-| `log_count_mismatch` | threshold | warn | sent_count ile log sayısı uyuşmuyor |
+Toplam 16+ ek kural — `vce.vce_dq_rules` tablosunu sorgulayarak tam listeye ulaşabilirsiniz:
 
-### Sender (5 kural)
-
-| Kural | Tip | Aksiyon | Açıklama |
-|-------|-----|---------|----------|
-| `no_active_sender` | threshold | fail | Aktif gönderici yok |
-| `smtp_incomplete_config` | threshold | warn | SMTP konfigürasyonu eksik |
-| `ses_incomplete_config` | threshold | warn | SES AWS key eksik |
-| `warmup_without_daily_limit` | threshold | warn | Warmup açık ama limit=0 |
-| `high_failure_rate` | threshold | warn | Sender failed oranı > %50 |
+```sql
+SELECT rule_domain, rule_subdomain, check_type, action, description
+FROM vce.vce_dq_rules
+ORDER BY rule_domain, rule_subdomain;
+```
 
 ---
 
 ## Bildirimler
 
-### Teams Bildirimi Yapılandırma
+**Teams:** Airflow UI → Admin → Variables → `VCE_TEAMS_WEBHOOK_URL`
 
-1. Teams kanalında: **Kanallar → ⋯ → Bağlayıcılar**
-2. **Incoming Webhook → Yapılandır**
-3. İsim ver, **Oluştur** tıkla
-4. URL'yi kopyala
-
-```
-Airflow UI → Admin → Variables → +
-Key   : VCE_TEAMS_WEBHOOK_URL
-Value : https://xxxx.webhook.office.com/webhookb2/...
-```
-
-### Slack Bildirimi Yapılandırma
-
-1. [Slack App oluştur](https://api.slack.com/apps) → **Incoming Webhooks**
-2. Kanalı seç, URL'yi al
-
-```
-Airflow UI → Admin → Variables → +
-Key   : VCE_SLACK_WEBHOOK_URL
-Value : https://hooks.slack.com/services/...
-```
-
-### Bildirim Formatı
-
-Teams bildirimi şu bilgileri içerir:
-- DAG adı ve çalışma zamanı
-- Başarısız/uyarı veren kontrollerin listesi (max 20)
-- İhlal açıklaması (kural description alanından)
+**Slack:** Airflow UI → Admin → Variables → `VCE_SLACK_WEBHOOK_URL`
 
 ---
 
 ## Orijinal VCE ile Farklar
 
-Bu proje, Coca-Cola AMATIL ortamı için geliştirilen orijinal VCE projesinden türetilmiştir. Temel mimari (kural tabanlı DB yaklaşımı, custom BaseOperator, execution kayıtları) korunmuş; aşağıdaki iyileştirmeler yapılmıştır:
-
-### Düzeltilen Bug'lar
-
-| Bug | Orijinal | Düzeltilmiş |
-|-----|----------|-------------|
-| **Class variable** | `fail_checks = []` sınıf seviyesinde → paralel task'larda paylaşılıyor | `self.fail_checks = []` instance seviyesinde |
-| **SQL Injection** | `f"...WHERE domain = '{self.domain}'"` | `cur.execute(sql, (self.domain,))` parametre binding |
-| **Hardcoded URL** | Webhook URL direkt kod içinde | Airflow Variable'dan okunur |
-| **Eksik raise** | `vce_monitoring.py`'de fail_checks dolunca raise yok | `AirflowException` eklendi |
-| **Bağlantı sızıntısı** | Bazı metodlarda finally bloğu yok | Tüm bağlantılar `finally` ile kapatılır |
-
-### Yeni Eklenen Özellikler
-
-- ✅ **Anomali tespiti** (Z-skoru, 30 günlük kayan pencere)
-- ✅ **Audit log** (kural değişiklik geçmişi)
-- ✅ **Remediation log** (temizlik kayıtları)
-- ✅ **Slack bildirimi** (Teams'e ek olarak)
-- ✅ **HTML Dashboard** (grafik, filtre, export)
-- ✅ **Freshness/Volume/Duplicate/Schema** kural tipleri
-- ✅ **tolerance** karşılaştırma tipi (TableValidation)
-- ✅ **test_flag** desteği (kural test modu)
-- ✅ **pre_sql_statement** (hem DataQuality hem TableValidation)
-
-### Değişmeyen Yapılar
-
-- ✅ `BaseOperator`'dan türetme yaklaşımı
-- ✅ `vce_dq_rules` tablosu konsepti
-- ✅ `rule_domain` / `rule_subdomain` gruplama
-- ✅ `fail` / `warn` aksiyon ayrımı
-- ✅ Execution sonuçlarını tabloya yazma
-- ✅ Teams bildirimi
+| Konu | Orijinal VCE | Bu Proje |
+|------|-------------|----------|
+| **Platform** | BigQuery | MySQL |
+| **Schema** | Tek schema | İki schema (vce + aws_mailsender_pro_v3) |
+| **Connection** | Tek connection | İki ayrı connection (vce / mailsender) |
+| **Class variable bug** | `fail_checks = []` class level | `self.fail_checks = []` instance level |
+| **SQL Injection** | f-string INSERT | Parametre binding |
+| **Webhook URL** | Hardcoded | Airflow Variable |
+| **Eksik raise** | vce_monitoring'de yok | AirflowException eklendi |
+| **Audit log** | Manuel dolduruluyor | MySQL trigger otomatik dolduruyor |
+| **Data retention** | Yok | Aylık MySQL partition |
+| **Anomali tespiti** | Yok | Z-skoru, 30 günlük kayan pencere |
+| **Remediation log** | Yok | vce.vce_remediation_log |
+| **Dashboard** | Yok | HTML + Chart.js |
 
 ---
 
 ## Sorun Giderme
 
-### Bağlantı Hatası
+### Bağlantı Testi
 
-```python
-# Docker içinden test:
+```bash
+# vce connection testi
 docker exec -it <airflow-scheduler> python3 -c "
 import pymysql
-c = pymysql.connect(
-    host='host.docker.internal',
-    port=3306,
-    user='airflow_dq',
-    password='SIFRE',
-    database='mailsender'
-)
-print('OK:', c.server_version)
+c = pymysql.connect(host='host.docker.internal', port=3306,
+    user='airflow_vce', password='SIFRE', database='vce')
+print('VCE OK:', c.server_version)
+c.close()
+"
+
+# mailsender connection testi
+docker exec -it <airflow-scheduler> python3 -c "
+import pymysql
+c = pymysql.connect(host='host.docker.internal', port=3306,
+    user='airflow_ms_dml', password='SIFRE', database='aws_mailsender_pro_v3')
+print('MailSender OK:', c.server_version)
 c.close()
 "
 ```
 
-Hata alıyorsanız kontrol edin:
-- MySQL `bind-address = 0.0.0.0` mi?
-- `airflow_dq` kullanıcısı `%` host ile mi oluşturuldu?
-- Docker `extra_hosts` tanımlı mı?
+### "Table not found" Hatası
 
-### Kural Çalışmıyor
+Kural SQL'inde schema prefix eksik olabilir:
 
 ```sql
--- Aktif mi?
-SELECT active_flag, execute_time FROM vce_dq_rules
-WHERE rule_domain = 'send_log' AND rule_subdomain = 'failed_ratio_threshold';
+-- ❌ Yanlış — vce schema'sında send_log aranır, bulunamaz
+SELECT COUNT(*) FROM send_log WHERE...
 
--- Doğru execute_time mi?
--- DAG'da execute_time='06:00' verildiyse, kural da '06:00' olmalı
+-- ✅ Doğru
+SELECT COUNT(*) FROM aws_mailsender_pro_v3.send_log WHERE...
 ```
 
-### Anomali Hiç Tetiklenmiyor
+Mevcut kuralları kontrol et:
 
 ```sql
--- Geçmiş veri yeterli mi? (7+ gün gerekli)
-SELECT COUNT(*), MIN(run_date), MAX(run_date)
-FROM vce_dq_executions
-WHERE rule_id = (
-    SELECT id FROM vce_dq_rules
-    WHERE rule_domain = 'send_log' AND rule_subdomain = 'failed_ratio_anomaly'
-)
-AND result_status = 'Passed';
+SELECT rule_domain, rule_subdomain, LEFT(sql_statement, 200) as sql_preview
+FROM vce.vce_dq_rules
+WHERE sql_statement NOT LIKE '%aws_mailsender_pro_v3%'
+  AND active_flag = 1;
 ```
 
-7'den az kayıt varsa sistem baseline biriktiriyor, anomali tetiklemiyor.
-
-### Teams Bildirimi Gitmiyor
+### Trigger Çalışmıyor
 
 ```sql
--- Airflow Variable mevcut mu?
--- Airflow UI → Admin → Variables → VCE_TEAMS_WEBHOOK_URL
+SHOW TRIGGERS FROM vce;
+-- trg_vce_rules_after_insert, _after_update, _after_delete görünmeli
 ```
 
-Airflow CLI ile kontrol:
+Görünmüyorsa şemayı yeniden yükle:
+
 ```bash
-airflow variables get VCE_TEAMS_WEBHOOK_URL
+mysql -u root -p vce < sql/01_vce_schema.sql
 ```
+
+### Partition Sorunu
+
+```sql
+-- p_future doldu mu? (yeni partition eklenmesi gerekebilir)
+SELECT PARTITION_NAME, TABLE_ROWS
+FROM information_schema.PARTITIONS
+WHERE TABLE_SCHEMA = 'vce'
+  AND TABLE_NAME = 'vce_dq_executions'
+  AND PARTITION_NAME = 'p_future';
+```
+
+Doluysa yeni ay partition'ı ekle (Partition Yönetimi bölümüne bak).
 
 ---
 
 ## Katkıda Bulunma
 
-### Yeni Kural Önerisi
+### Yeni Kural
 
-En iyi yol doğrudan `02_vce_seed_rules.sql` dosyasına INSERT eklemek:
-
-1. Kural domain ve subdomain belirle
-2. SQL'i yaz ve manuel test et: sonucu > 0 mu?
-3. Açıklama yaz (en az 2 cümle, neden var, ne kontrol ediyor)
-4. Pull request aç
+```sql
+-- Schema prefix zorunlu!
+INSERT INTO vce.vce_dq_rules (..., sql_statement, ...) VALUES (
+    ...,
+    'SELECT COUNT(*) FROM aws_mailsender_pro_v3.TABLO WHERE ...',
+    ...
+);
+-- Trigger otomatik audit log'a yazar
+```
 
 ### Yeni Operatör
 
-`VCEBaseOperator`'dan türet ve şunları implement et:
-- `execute(self, context)` metodu
-- `fail_checks` ve `warn_checks` instance variable olarak başlat
-- Tüm DB bağlantılarını `finally` ile kapat
-- Bildirimler için `self.send_notifications()` kullan
+`VCEBaseOperator`'dan türet. Metodları doğru kullan:
 
-### Kod Standardı
-
-- Tüm SQL'lerde parametre binding (`%s`)
-- Her method için docstring
-- Türkçe log mesajları (bu proje Türkçe ekip için)
-- Kritik SQL'ler için inline yorum
-
----
-
-## Lisans
-
-MIT License — ayrıntılar için [LICENSE](LICENSE) dosyasına bakın.
+```python
+self.run_vce_query(sql)        # vce schema'dan oku
+self.run_mailsender_query(sql) # aws_mailsender_pro_v3'ten oku
+self.execute_vce_dml(sql)      # vce schema'ya yaz
+```
 
 ---
 
 <div align="center">
-  <sub>MailSender Pro VCE · Apache Airflow · MySQL · Python</sub>
+  <sub>VCE · vce schema · aws_mailsender_pro_v3 schema · Apache Airflow · MySQL Partitioning</sub>
 </div>

@@ -1,5 +1,5 @@
 # VCE — Validity Control Engine for MailSender Pro
-
+#Orjinal halini cocacolada yaptım fakat eksikleri vardı bu halinde tüm eksikler giderildi, sayfanın altında yenilikleri görebilirisiniz.
 > **Apache Airflow + MySQL tabanlı, kural yönetimi veritabanında olan, üretim seviyesi veri kalitesi sistemi.**
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)](https://python.org)

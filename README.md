@@ -1222,8 +1222,8 @@ Testler gerçek MySQL gerektirmez — `unittest.mock` ile sahte bağlantılar ku
 | Remediation log | Yok | `vce.vce_remediation_log` |
 | Test altyapısı | Yok | 51 unit test |
 | Kural test aracı | Yok | `tools/test_rule.py` CLI |
-| Dashboard | Yok | HTML + Chart.js |
-| Partition yönetimi | Yok | Otomatik DAG |
+| Dashboard | Power BI | HTML + Chart.js |
+| Partition yönetimi | Big Query Kendisi yapıyor | Otomatik DAG |
 
 ---
 

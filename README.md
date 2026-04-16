@@ -1,7 +1,6 @@
 # VCE — Validity Control Engine for MailSender Pro
 
-> **Apache Airflow + MySQL tabanlı, kural yönetimi veritabanında olan, üretim seviyesi veri kalitesi sistemi. Bu projeye cocacolada başladım fakat eksiklikleri anca bu gün bitirebildim.**
-
+> **Apache Airflow + MySQL tabanlı, kural yönetimi veritabanında olan, üretim seviyesi veri kalitesi sistemi.**
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)](https://python.org)
 [![Airflow](https://img.shields.io/badge/Apache%20Airflow-2.6%2B-017CEE?logo=apacheairflow)](https://airflow.apache.org)
@@ -1536,3 +1535,222 @@ MailSender Pro'nun gereksinimleri için VCE, Soda Core'un sağlayamadığı
 operasyonel özellikleri ücretsiz olarak sunar. Soda Cloud ücretli plana
 geçildiğinde bile kural yönetiminin YAML'a bağlı kalması ve audit trail
 eksikliği temel kısıtlamalar olmaya devam eder.
+
+---
+
+## Great Expectations ve Soda'dan İlham Alınan Eklemeler
+
+Bu bölüm, GE ve Soda'nın en değerli özelliklerinden VCE mimarisine uyarlananları açıklar.
+Eklenen her özellik iki schema ayrımını (vce / mailsender) korur ve mevcut tablolarla
+entegre çalışır.
+
+---
+
+### 1. Failed Rows Sampling — Hangi Satırlar İhlal Ediyor?
+
+**İlham:** Great Expectations row-level validation · Soda failed rows sampling
+
+Klasik VCE kontrolü yalnızca "142 satır ihlal var" der. Bu ekleme ile kural
+fail ettiğinde hangi satırların sorunlu olduğu da gösterilir.
+
+**Nasıl çalışır:**
+
+`vce_dq_rules` tablosuna `sample_sql` kolonu eklendi. Bu alana ihlal eden
+satırları döndüren SQL yazılır:
+
+```sql
+-- vce_dq_rules'a örnek kural:
+UPDATE vce.vce_dq_rules
+SET sample_sql =
+  'SELECT id, recipient, sender_id, sent_at, error_msg
+   FROM aws_mailsender_pro_v3.send_log
+   WHERE recipient IS NULL
+   ORDER BY sent_at DESC
+   LIMIT 10'
+WHERE rule_subdomain = 'null_critical_fields';
+```
+
+Kural fail ettiğinde `FailedRowsSamplingMixin` bu SQL'i çalıştırır
+ve sonucu `vce.vce_failed_rows_samples` tablosuna yazar.
+
+**Örnek sorgu:**
+
+```sql
+-- "Bu kural son seferde hangi satırları yakaladı?"
+SELECT rule_subdomain, sample_data, sample_count,
+       total_violation_count, sampled_at
+FROM vce.vce_failed_rows_samples
+WHERE rule_id = 3
+ORDER BY sampled_at DESC
+LIMIT 5;
+```
+
+`sample_data` JSON formatında örnek satırları içerir:
+```json
+[
+  {"id": "84521", "recipient": null, "sender_id": "2", "sent_at": "2026-04-13 06:12:33"},
+  {"id": "84398", "recipient": null, "sender_id": "5", "sent_at": "2026-04-13 06:09:11"}
+]
+```
+
+---
+
+### 2. Column Stats — Kolon Profili ve Trend İzleme
+
+**İlham:** Great Expectations column-level stats · Soda metric store
+
+Tablo kolonlarının istatistiklerini günlük olarak toplar ve saklar.
+Trend analizi için temel oluşturur.
+
+**Toplanan istatistikler:**
+
+| İstatistik | Açıklama | Kolon Tipi |
+|-----------|----------|-----------|
+| `null_rate` | NULL oranı (0.00-1.00) | Tümü |
+| `distinct_count` | Benzersiz değer sayısı | Tümü |
+| `min/max/mean/std` | Sayısal dağılım | Numeric |
+| `p25/p50/p75` | Persentiller | Numeric |
+| `min/max/avg_length` | Metin uzunluğu | Text |
+| `min_date/max_date` | Tarih aralığı | Datetime |
+| `top_values` | En çok tekrar eden 5 değer | Categorical |
+
+**Hangi kolonlar izlenecek** `vce.vce_column_stats_config` tablosuna INSERT ile belirlenir.
+Seed dosyasıyla 10 kolon önceden tanımlıdır (`send_log.recipient`, `send_log.status` vb.)
+
+**DAG kullanımı:**
+
+```python
+from operators.vce_operators_extended import ColumnStatsOperator
+
+stats_task = ColumnStatsOperator(
+    task_id="collect_column_stats",
+    schema_filter="aws_mailsender_pro_v3",
+    table_filter="send_log",   # Sadece send_log (None = tüm tablolar)
+)
+```
+
+**Örnek trend analizi:**
+
+```sql
+-- "send_log.recipient NULL oranı son 30 günde arttı mı?"
+SELECT DATE(collected_at) as gun, null_rate, distinct_count, row_count
+FROM vce.vce_column_stats
+WHERE table_name  = 'send_log'
+  AND column_name = 'recipient'
+  AND collected_at >= NOW() - INTERVAL 30 DAY
+ORDER BY collected_at;
+
+-- "status kolonu dağılımı bu ay nasıl değişti?"
+SELECT DATE(collected_at) as gun, top_values
+FROM vce.vce_column_stats
+WHERE table_name  = 'send_log'
+  AND column_name = 'status'
+ORDER BY collected_at DESC LIMIT 30;
+```
+
+**Eşik uyarısı:** `max_null_rate` veya `min_distinct_count` tanımlanmışsa
+eşik aşıldığında Teams/Slack bildirimi gönderilir.
+
+---
+
+### 3. Distribution Check — Değer Dağılımı Kontrolü
+
+**İlham:** Soda Core distribution check
+
+COUNT bazlı kontroller toplam sayıyı denetler. Distribution check ise
+oranları denetler — toplam hacimden bağımsız olarak.
+
+**Fark neden önemli?**
+
+```
+Senaryo: Gönderim hacmi düştü
+
+COUNT bazlı: "failed > 100 ise fail"
+  → Önceki gün 500 failed: FAIL
+  → Bugün 50 failed: PASS — ama failed oranı %5'ten %55'e çıktı!
+
+Distribution check: "failed oranı %30'u geçerse fail"
+  → Her iki durumda da %55 oranı yakalanır → FAIL ✅
+```
+
+**Seed ile gelen hazır distribution check'ler:**
+
+| Kontrol | Tablo | Kolon | Beklenen |
+|---------|-------|-------|----------|
+| `status_distribution` | `send_log` | `status` | sent: %60-98, failed: %1-30 |
+| `provider_distribution` | `send_log` | `provider` | smtp/ses/api dağılımı |
+| `notification_type_distribution` | `ses_notifications` | `notif_type` | Bounce<%10, Complaint<%2 |
+| `validity_distribution` | `email_verify_jobs` | `valid_count` | valid_rate >%20 |
+
+**DAG kullanımı:**
+
+```python
+from operators.vce_operators_extended import DistributionCheckOperator
+
+dist_task = DistributionCheckOperator(
+    task_id="check_send_log_distribution",
+    check_domain="send_log",
+)
+```
+
+**Yeni distribution check eklemek:**
+
+```sql
+INSERT INTO vce.vce_distribution_checks
+    (check_domain, check_subdomain, schema_name, table_name, column_name,
+     where_clause, expected_distribution, action, description, active_flag, author)
+VALUES (
+    'send_log', 'sender_mode_distribution',
+    'aws_mailsender_pro_v3', 'senders', 'sender_mode',
+    'is_active = 1',
+    '[
+        {"value": "smtp", "min_pct": 0,  "max_pct": 100},
+        {"value": "ses",  "min_pct": 0,  "max_pct": 100},
+        {"value": "api",  "min_pct": 0,  "max_pct": 100}
+    ]',
+    'warn',
+    'Aktif gönderici modlarının dağılımını izler.',
+    1, 'senin_adin'
+);
+```
+
+---
+
+### Kurulum
+
+```bash
+# Yeni tablo ve kolonları ekle (mevcut veritabanına)
+mysql -u root -p vce < sql/03_vce_extensions.sql
+```
+
+Bu komut şunları oluşturur:
+
+- `vce.vce_failed_rows_samples` (aylık partition)
+- `vce.vce_column_stats` (aylık partition)
+- `vce.vce_column_stats_config` + 10 hazır kolon tanımı
+- `vce.vce_distribution_checks` + 4 hazır distribution check
+- `vce_dq_rules.sample_sql` kolonu
+- `vce_dq_executions.sample_count` kolonu
+
+DAG dosyalarını Airflow'a kopyala:
+
+```
+dags/operators/vce_operators_extended.py
+```
+
+### Klasör Yapısı Güncellemesi
+
+```
+operators/
+├── vce_operators.py              # Temel operatörler (değişmedi)
+└── vce_operators_extended.py     # Yeni: GE + Soda ilhamlı operatörler
+    ├── ColumnStatsOperator       # Kolon profili istatistikleri
+    ├── DistributionCheckOperator # Değer dağılımı kontrolü
+    └── FailedRowsSamplingMixin   # İhlal satırı örnekleme
+
+sql/
+├── 01_vce_schema.sql             # Temel şema (değişmedi)
+├── 02_vce_seed_rules.sql         # 35 kural (değişmedi)
+└── 03_vce_extensions.sql         # Yeni: 3 tablo + seed data
+```
+

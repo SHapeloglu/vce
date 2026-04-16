@@ -1,5 +1,5 @@
 # VCE — Validity Control Engine for MailSender Pro
-#Orjinal halini cocacolada yaptım fakat eksikleri vardı, eksikleri tamamlamak bu güne nasipmiş, halinde tüm eksikler giderildi, sayfanın altında yenilikleri görebilirisiniz.
+
 > **Apache Airflow + MySQL tabanlı, kural yönetimi veritabanında olan, üretim seviyesi veri kalitesi sistemi.**
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)](https://python.org)
@@ -40,6 +40,7 @@
 - [Orijinal VCE ile Farklar](#orijinal-vce-ile-farklar)
 - [Sorun Giderme](#sorun-giderme)
 - [Katkıda Bulunma](#katkıda-bulunma)
+- [Neden Soda Core Değil?](#neden-soda-core-değil)
 
 ---
 
@@ -1222,8 +1223,8 @@ Testler gerçek MySQL gerektirmez — `unittest.mock` ile sahte bağlantılar ku
 | Remediation log | Yok | `vce.vce_remediation_log` |
 | Test altyapısı | Yok | 51 unit test |
 | Kural test aracı | Yok | `tools/test_rule.py` CLI |
-| Dashboard | Power BI | HTML + Chart.js |
-| Partition yönetimi | Big Query Kendisi yapıyor | Otomatik DAG |
+| Dashboard | Yok | HTML + Chart.js |
+| Partition yönetimi | Yok | Otomatik DAG |
 
 ---
 
@@ -1342,3 +1343,195 @@ def test_new_behavior(self, operator):
     VCE · vce schema · aws_mailsender_pro_v3 · Apache Airflow · MySQL 8.0 Partitioning · 35 kural · 51 unit test
   </sub>
 </div>
+
+---
+
+## Neden Soda Core Değil?
+
+Bu projeyi geliştirirken Soda Core ciddi bir alternatif olarak değerlendirildi.
+Soda, YAML tabanlı kural yazımı ve Airflow entegrasyonu açısından güçlü bir araç.
+Ancak MailSender Pro'nun operasyonel gereksinimleri VCE mimarisini zorunlu kıldı.
+Aşağıda her iki yaklaşım somut olarak karşılaştırılmıştır.
+
+---
+
+### 1. Kural Yönetimi: DB vs YAML
+
+**Soda'da** yeni kural eklemek için `checks.yml` dosyasını değiştirip `git commit`
+yapman, sonra Airflow'a deploy etmen gerekir:
+
+```yaml
+# checks.yml — dosyayı değiştir, commit at, deploy et
+checks for send_log:
+  - failed_count < 100
+  - missing_count(recipient) = 0
+```
+
+**VCE'de** tek bir SQL INSERT yeterlidir. Kod değişmez, deploy gerekmez,
+Airflow yeniden başlatılmaz. Kural bir sonraki DAG çalışmasında anında aktif olur:
+
+```sql
+INSERT INTO vce.vce_dq_rules
+  (rule_domain, rule_subdomain, sql_statement, action, description, active_flag)
+VALUES
+  ('send_log', 'my_new_check',
+   'SELECT COUNT(*) FROM aws_mailsender_pro_v3.send_log WHERE ...',
+   'warn', 'Açıklama', 1);
+```
+
+Üretimde gece 02:00'da acil bir kural eklemek gerektiğinde VCE'de tek bir
+SQL yeterlidir. Soda'da git erişimi, commit ve deploy süreci gerekir.
+
+---
+
+### 2. Kural Geçmişi: Trigger vs Git Log
+
+Soda'da bir kural değiştirildiğinde yapısal bir geçmiş saklanmaz.
+Git commit geçmişine bakmak gerekir — bu her zaman mümkün değildir ve
+kim ne zaman neden değiştirdi bilgisi commit mesajının kalitesine bağlıdır.
+
+VCE'de her kural değişikliği MySQL trigger tarafından otomatik olarak
+`vce_rule_audit_log` tablosuna yazılır:
+
+```sql
+-- "Bu kural 2 ay önce nasıldı?" sorusu saniyeler içinde yanıtlanır
+SELECT change_type, changed_by, changed_at,
+       LEFT(old_sql, 100) as eski,
+       LEFT(new_sql, 100) as yeni
+FROM vce.vce_rule_audit_log
+WHERE rule_subdomain = 'failed_ratio_threshold'
+ORDER BY changed_at DESC;
+```
+
+---
+
+### 3. Operasyonel Kontrol: active_flag, test_flag, author
+
+Soda'da bir kuralı geçici olarak devre dışı bırakmak için YAML'dan kaldırıp
+commit atman gerekir. Kimin yazdığı, neden kapatıldığı bilgisi YAML formatında
+yapısal olarak saklanamaz.
+
+VCE'de tüm bunlar tablo kolonları olarak mevcuttur:
+
+```sql
+-- Deploy etmeden, anlık deaktif et
+UPDATE vce.vce_dq_rules
+SET active_flag = 0,
+    non_active_description = 'Kampanya dönemi — hacim artışı bekleniyor'
+WHERE rule_subdomain = 'daily_volume';
+
+-- Test moduna al: çalışır ama aksiyon almaz, sadece loglar
+UPDATE vce.vce_dq_rules
+SET test_flag = 1
+WHERE rule_subdomain = 'my_new_check';
+```
+
+---
+
+### 4. Anomali Tespiti
+
+Soda Core'un açık kaynak versiyonunda anomali tespiti yoktur.
+Z-skoru tabanlı dinamik eşik yalnızca **Soda Cloud** (ücretli) sürümünde mevcuttur.
+
+VCE'de anomali tespiti tamamen açık kaynak olarak uygulanmıştır:
+
+```
+Geçmiş 30 günlük değerler → ortalama + standart sapma
+Z-skoru = |mevcut - ortalama| / std
+|Z| > 3 → anomali (%99.7 güven aralığı dışı)
+Sonuçlar → baseline_mean, baseline_std, z_score kolonlarına kaydedilir
+```
+
+---
+
+### 5. Execution Geçmişi ve Sorgulama
+
+Soda Core'da execution geçmişi yerel olarak saklanmaz. Soda Cloud olmadan
+"Bu kural geçen hafta kaç kez fail etti?" sorusu yanıtsız kalır.
+
+VCE'de her kural çalışması `vce.vce_dq_executions` tablosuna yazılır:
+
+```sql
+-- Son 30 günde hangi kurallar en çok fail etti?
+SELECT rule_domain, rule_subdomain,
+       COUNT(*) as toplam,
+       SUM(result_status = 'Failed') as fail_sayisi,
+       ROUND(SUM(result_status = 'Failed') / COUNT(*) * 100, 1) as fail_orani
+FROM vce.vce_dq_executions
+WHERE run_date >= NOW() - INTERVAL 30 DAY
+GROUP BY rule_domain, rule_subdomain
+HAVING fail_sayisi > 0
+ORDER BY fail_orani DESC;
+```
+
+---
+
+### 6. Remediation Entegrasyonu
+
+Soda, veri kalitesi denetimi yapar. Tespit ettiği sorunları gidermek için
+ayrı bir mekanizma yoktur.
+
+VCE'de `RemediationOperator` denetim ve temizlik süreçlerini entegre eder:
+
+```
+Gece 03:00 → remediation DAG
+  aws_mailsender_pro_v3 tablolarını temizle
+  Her işlemi vce.vce_remediation_log'a kaydet
+
+Sabah 06:00 → main DAG
+  Temizlenen tablolarda beklenen boyutlar var mı kontrol et
+  Remediation başarısız olduysa ilgili kontrol fail verir
+```
+
+Soda'da bu iki süreç birbirinden habersiz, ayrı sistemler olurdu.
+
+---
+
+### 7. İki Schema Yetki Ayrımı
+
+Soda, bağlantı bazlı çalışır ve iki farklı schema arasındaki yetki ayrımını
+operatör düzeyinde yönetmez.
+
+VCE'de `get_vce_conn()` ve `get_mailsender_conn()` metodlarıyla iki schema
+birbirinden tamamen izole edilmiştir:
+
+```python
+# Kural SQL'i her zaman mailsender connection üzerinde çalışır
+rows = self.run_mailsender_query(sql)   # aws_mailsender_pro_v3 — sadece okur
+
+# Sonuç her zaman vce connection üzerinde yazılır
+self.execute_vce_dml(insert_sql)        # vce — yazar
+```
+
+`mailsender` connection'ının VCE tablolarına yazma yetkisi yoktur.
+`vce` connection'ının MailSender production verisini değiştirme yetkisi yoktur.
+
+---
+
+### Özet Karşılaştırma
+
+| Özellik | Soda Core (açık kaynak) | Soda Cloud (ücretli) | VCE |
+|---------|:----------------------:|:-------------------:|:---:|
+| Kural yönetimi | YAML + deploy | YAML + UI | MySQL INSERT |
+| Deploy gerektirmeden kural ekleme | ❌ | ❌ | ✅ |
+| Kural audit trail (trigger) | ❌ | Kısmi | ✅ |
+| active_flag / test_flag / author | ❌ | ❌ | ✅ |
+| Anomali tespiti (Z-skoru) | ❌ | ✅ | ✅ |
+| Execution geçmişi sorgulama | ❌ | ✅ | ✅ |
+| Remediation entegrasyonu | ❌ | ❌ | ✅ |
+| İki schema yetki ayrımı | ❌ | ❌ | ✅ |
+| MySQL desteği | ✅ | ✅ | ✅ |
+| Airflow entegrasyonu | ✅ | ✅ | ✅ |
+| Ücret | Ücretsiz | Ücretli | Ücretsiz |
+
+**Soda Core'un güçlü olduğu yer:** Hızlı kurulum, YAML okunabilirliği,
+dbt entegrasyonu, BigQuery/Snowflake gibi modern veri yığını desteği.
+
+**VCE'nin güçlü olduğu yer:** Operasyonel esneklik, tam audit trail,
+DB tabanlı kural yönetimi, anomali tespiti, remediation entegrasyonu,
+iki schema yetki ayrımı — tümü açık kaynak ve ücretsiz.
+
+MailSender Pro'nun gereksinimleri için VCE, Soda Core'un sağlayamadığı
+operasyonel özellikleri ücretsiz olarak sunar. Soda Cloud ücretli plana
+geçildiğinde bile kural yönetiminin YAML'a bağlı kalması ve audit trail
+eksikliği temel kısıtlamalar olmaya devam eder.

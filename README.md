@@ -41,6 +41,8 @@
 - [Sorun Giderme](#sorun-giderme)
 - [Katkıda Bulunma](#katkıda-bulunma)
 - [Neden Soda Core Değil?](#neden-soda-core-değil)
+- [Great Expectations ve Soda'dan İlham Alınan Eklemeler](#great-expectations-ve-sodadan-ilham-alınan-eklemeler)
+- [ML Lifecycle ve Data Product Mindset](#ml-lifecycle-ve-data-product-mindset)
 
 ---
 
@@ -160,10 +162,13 @@ ZIP'ten çıkan `dags/` klasörünün içeriğini Airflow'un dags klasörüne ko
 ```
 C:\Users\yeliz\Desktop\apache-airflow-docker\dags\
     operators\
-        vce_operators.py                     ← VCE custom operatörleri
-    mailsender_vce_main.py                   ← Ana denetim DAG'ı
-    mailsender_vce_remediation.py            ← Temizlik DAG'ı
-    mailsender_vce_partition_manager.py      ← Partition yönetimi DAG'ı
+        vce_operators.py                     ← Temel operatörler
+        vce_operators_extended.py            ← GE+Soda ilhamlı operatörler
+        vce_operators_ml_lifecycle.py        ← ML lifecycle + data product
+    mailsender_vce_main.py                   ← Ana denetim DAG'ı (06:00)
+    mailsender_vce_remediation.py            ← Temizlik DAG'ı (03:00)
+    mailsender_vce_partition_manager.py      ← Partition yönetimi (ayın 1'i 01:00)
+    mailsender_vce_ml_lifecycle.py           ← ML lifecycle + data product (07:00)
 ```
 
 > **Önemli:** `vce_operators.py` mutlaka `dags/operators/` altında olmalı.
@@ -273,6 +278,8 @@ Airflow UI'da DAG listesinde üç DAG görünmeli:
 mailsender_vce_partition_manager
 mailsender_vce_remediation
 mailsender_vce_main
+mailsender_vce_ml_lifecycle
+mailsender_vce_weekly_report
 ```
 
 **Çalıştırma sırası:**
@@ -339,15 +346,19 @@ ORDER BY result_status DESC, rule_domain;
 İlk manuel testler başarılıysa DAG'lar schedule'a göre otomatik çalışır:
 
 ```
-Her ayın 1'i  01:00 UTC  → mailsender_vce_partition_manager
-Her gün       03:00 UTC  → mailsender_vce_remediation
-Her gün       06:00 UTC  → mailsender_vce_main
+Her ayın 1'i  01:00 UTC  → mailsender_vce_partition_manager  (partition ekle/düşür)
+Her gün       03:00 UTC  → mailsender_vce_remediation        (eski kayıtları temizle)
+Her gün       06:00 UTC  → mailsender_vce_main               (35 kural denetimi)
+Her gün       07:00 UTC  → mailsender_vce_ml_lifecycle       (drift, kalite, SLA)
+Her Pazartesi 07:00 UTC  → mailsender_vce_weekly_report      (haftalık sağlık raporu)
 ```
 
 > **UTC/Türkiye saati farkı:** UTC+3 olduğu için Türkiye saatiyle:
 > - Partition manager : her ayın 1'i **04:00**
 > - Remediation       : her gün **06:00**
 > - Ana denetim       : her gün **09:00**
+> - ML Lifecycle      : her gün **10:00**
+> - Haftalık rapor    : her Pazartesi **10:00**
 
 Schedule'ı yerel saate uyarlamak istersen DAG dosyalarındaki
 `schedule_interval` değerini değiştir:
@@ -371,6 +382,9 @@ schedule_interval="0 3 * * *",   # UTC 03:00 = TR 06:00
 | "Table not found" | Schema prefix eksik | Kural SQL'ini `test_rule.py` ile test et |
 | Task kırmızı ama hata yok | Kural ihlali — normal | `vce_dq_executions` tablosunu sorgula |
 | p_future dolu uyarısı | Partition eklemedi | `partition_manager` DAG'ını manuel tetikle |
+| Kalite skoru hesaplanmıyor | data_products kaydı yok | `04_vce_ml_lifecycle.sql` çalıştırıldı mı? |
+| Drift yanlış alarm veriyor | Threshold çok düşük | `drift_threshold=3.0` parametresini dene |
+| model_performance boş | Feedback tablosu boş | `vce_anomaly_feedback`'e geri bildirim ekle |
 
 ---
 
@@ -382,13 +396,28 @@ Bu projenin en kritik tasarım kararı: **iki ayrı MySQL schema, aynı sunucuda
 Aynı MySQL Sunucusu
 │
 ├── vce                          ← VCE altyapı tabloları
-│   ├── vce_dq_rules             (kural tanımları)
-│   ├── vce_dq_executions        (sonuçlar — aylık partition)
-│   ├── vce_table_validations    (karşılaştırma tanımları)
-│   ├── vce_table_val_executions (karşılaştırma sonuçları — aylık partition)
-│   ├── vce_rule_audit_log       (kural değişiklik geçmişi)
-│   ├── vce_remediation_log      (temizlik kayıtları — aylık partition)
-│   └── vce_anomaly_baselines    (anomali istatistikleri)
+│   ├── vce_dq_rules                  (kural tanımları)
+│   ├── vce_dq_executions             (sonuçlar — aylık partition)
+│   ├── vce_table_validations         (karşılaştırma tanımları)
+│   ├── vce_table_val_executions      (karşılaştırma sonuçları — aylık partition)
+│   ├── vce_rule_audit_log            (kural değişiklik geçmişi — trigger)
+│   ├── vce_remediation_log           (temizlik kayıtları — aylık partition)
+│   ├── vce_anomaly_baselines         (anomali istatistikleri)
+│   │
+│   ├── ── GE+Soda İlhamlı (03_vce_extensions.sql) ──────────────────────
+│   ├── vce_failed_rows_samples       (ihlal satırı örnekleri — aylık partition)
+│   ├── vce_column_stats              (kolon profili istatistikleri — aylık partition)
+│   ├── vce_column_stats_config       (hangi kolon izlenecek — 10 hazır)
+│   ├── vce_distribution_checks       (dağılım kontrol tanımları — 4 hazır)
+│   │
+│   └── ── ML Lifecycle + Data Product (04_vce_ml_lifecycle.sql) ─────────
+│       ├── vce_anomaly_feedback      (gerçek/yanlış alarm geri bildirimi)
+│       ├── vce_concept_drift_log     (baseline sıfırlama olayları)
+│       ├── vce_model_performance     (günlük model performans özeti)
+│       ├── vce_data_products         (data product registry — 6 ürün hazır)
+│       ├── vce_quality_scores        (günlük kalite skoru — aylık partition)
+│       ├── vce_sla_violations        (SLA ihlal kayıtları)
+│       └── vce_data_product_changelog (data product değişiklik geçmişi)
 │
 └── aws_mailsender_pro_v3        ← MailSender Pro uygulama tabloları
     ├── send_log
@@ -539,6 +568,17 @@ Her gün
 - `old_sql` / `new_sql` karşılaştırması — tam değişiklik geçmişi
 - `CURRENT_USER()` ile kim değiştirdi bilgisi otomatik
 
+### ML Model Lifecycle
+- `ConceptDriftOperator` — baseline'larda istatistiksel kayma tespiti, otomatik sıfırlama
+- `vce_anomaly_feedback` — gerçek/yanlış alarm geri bildirimi, precision hesabı temeli
+- `vce_model_performance` — günlük precision, false positive oranı, drift takibi
+
+### Data Product Mindset
+- `vce_data_products` — her tablo bir ürün: owner, SLA, kalite eşiği, consumers
+- `QualityScoreOperator` — günlük kalite skoru (pass/total × 100), trend analizi
+- `SLAMonitorOperator` — freshness SLA ihlal tespiti ve kayıt altına alma
+- `DataProductReportOperator` — haftalık sağlık raporu, Teams/Slack özeti
+
 ### Test Altyapısı
 - 51 unit test, 8 test sınıfı — gerçek MySQL olmadan çalışır
 - `tools/test_rule.py` CLI ile kural SQL'i deploy öncesi doğrulanır
@@ -554,19 +594,37 @@ vce_mailsender/
 │
 ├── sql/
 │   ├── 01_vce_schema.sql              # vce schema: 7 tablo + 3 trigger + partition tanımları
-│   └── 02_vce_seed_rules.sql          # 35 hazır kural (9 domain, aws_mailsender_pro_v3 prefix'li)
+│   ├── 02_vce_seed_rules.sql          # 35 hazır kural (9 domain, aws_mailsender_pro_v3 prefix'li)
+│   ├── 03_vce_extensions.sql          # GE+Soda ilhamlı: failed rows, column stats, distribution
+│   └── 04_vce_ml_lifecycle.sql        # ML lifecycle + data product: 7 yeni tablo + 6 data product
 │
 ├── operators/
-│   └── vce_operators.py               # Custom Airflow operatörleri (~998 satır)
-│       ├── VCEBaseOperator            # İki connection yönetimi, bildirim, kayıt
-│       ├── DataQualityOperator        # Kural SQL çalıştırıcı + anomali motoru
-│       ├── TableValidationOperator    # Kaynak-hedef karşılaştırma
-│       └── RemediationOperator        # Otomatik temizlik
+│   ├── vce_operators.py               # Temel operatörler (~998 satır)
+│   │   ├── VCEBaseOperator            # İki connection yönetimi, bildirim, kayıt
+│   │   ├── DataQualityOperator        # Kural SQL çalıştırıcı + anomali motoru
+│   │   ├── TableValidationOperator    # Kaynak-hedef karşılaştırma
+│   │   └── RemediationOperator        # Otomatik temizlik
+│   ├── vce_operators_extended.py      # GE+Soda ilhamlı operatörler (~729 satır)
+│   │   ├── ColumnStatsOperator        # Kolon profili istatistikleri
+│   │   ├── DistributionCheckOperator  # Değer dağılımı kontrolü
+│   │   └── FailedRowsSamplingMixin    # İhlal satırı örnekleme
+│   └── vce_operators_ml_lifecycle.py  # ML lifecycle + data product (~962 satır)
+│       ├── ConceptDriftOperator       # Baseline drift tespiti ve sıfırlama
+│       ├── ModelPerformanceOperator   # Günlük model performans özeti
+│       ├── QualityScoreOperator       # Data product kalite skoru
+│       ├── SLAMonitorOperator         # Freshness SLA denetimi
+│       └── DataProductReportOperator  # Haftalık sağlık raporu
 │
 ├── dags/
-│   ├── mailsender_vce_main.py         # Ana denetim DAG'ı — her gün 06:00
-│   ├── mailsender_vce_remediation.py  # Temizlik DAG'ı — her gün 03:00
-│   └── mailsender_vce_partition_manager.py  # Partition yönetimi — her ayın 1'i 01:00
+│   ├── operators/                     # Airflow import için operatör kopyaları
+│   │   ├── vce_operators.py
+│   │   ├── vce_operators_extended.py
+│   │   └── vce_operators_ml_lifecycle.py
+│   ├── mailsender_vce_main.py              # Ana denetim DAG'ı — her gün 06:00
+│   ├── mailsender_vce_remediation.py       # Temizlik DAG'ı — her gün 03:00
+│   ├── mailsender_vce_partition_manager.py # Partition yönetimi — her ayın 1'i 01:00
+│   ├── mailsender_vce_ml_lifecycle.py      # ML lifecycle + data product — her gün 07:00
+│   └── mailsender_vce_weekly_report.py     # Haftalık rapor — her Pazartesi 07:00
 │
 ├── tests/
 │   ├── conftest.py                    # pytest konfigürasyonu
@@ -628,12 +686,28 @@ FLUSH PRIVILEGES;
 #### 3. VCE Şemasını ve Tablolarını Oluştur
 
 ```bash
+# Temel şema: 7 tablo, 3 trigger, partition tanımları
 mysql -u root -p vce < sql/01_vce_schema.sql
+
+# 35 hazır kural
+mysql -u root -p vce < sql/02_vce_seed_rules.sql
+
+# GE+Soda ilhamlı: failed rows, column stats, distribution check
+mysql -u root -p vce < sql/03_vce_extensions.sql
+
+# ML lifecycle + data product: 7 yeni tablo, 6 data product seed
+mysql -u root -p vce < sql/04_vce_ml_lifecycle.sql
 ```
 
-Bu komut şunları oluşturur:
+> **Not:** Dosyalar sırayla çalıştırılmalıdır — her dosya bir öncekinin
+> tablolarına bağımlıdır.
 
-**7 Tablo:**
+Yalnızca temel kurulum istiyorsan `01` ve `02` yeterlidir.
+`03` ve `04` genişletilmiş özellikler için opsiyoneldir.
+
+Bu komutlar şunları oluşturur:
+
+**Temel: 7 Tablo (01_vce_schema.sql):**
 
 | Tablo | Partition | Açıklama |
 |-------|-----------|----------|
@@ -1752,5 +1826,236 @@ sql/
 ├── 01_vce_schema.sql             # Temel şema (değişmedi)
 ├── 02_vce_seed_rules.sql         # 35 kural (değişmedi)
 └── 03_vce_extensions.sql         # Yeni: 3 tablo + seed data
+```
+
+
+---
+
+## ML Lifecycle ve Data Product Mindset
+
+Bu bölüm, VCE'ye eklenen iki ileri düzey kavramı ve bunların uygulamalarını açıklar.
+
+---
+
+### ML Model Lifecycle
+
+VCE'deki Z-skoru anomali tespiti aslında bir istatistiksel modeldir. Her model gibi
+izlenmesi, değerlendirilmesi ve zamanla güncellenmesi gerekir.
+
+#### Concept Drift — Baseline Geçerliliği
+
+**Problem:** MailSender büyüdükçe günlük gönderim hacmi artar. Eski baseline
+(mean=500 gönderim/gün) yeni veriyle (mean=5000 gönderim/gün) uyuşmaz —
+her gün "ANOMALİ" uyarısı üretir.
+
+**Çözüm:** `ConceptDriftOperator` her gün 07:00'da çalışır:
+
+```
+Son 7 gün ortalaması ← → 90 günlük baseline
+Fark > 2 standart sapma → drift tespit edildi
+→ vce_anomaly_baselines sıfırlanır
+→ vce_concept_drift_log'a olay yazılır
+→ Model yeniden 7+ gün öğrenir
+```
+
+Manuel baseline sıfırlama:
+
+```sql
+-- Belirli bir kuralın baseline'ını elle sıfırla
+UPDATE vce.vce_anomaly_baselines
+SET mean_value = NULL, std_value = NULL, sample_count = 0
+WHERE rule_id = (
+    SELECT id FROM vce.vce_dq_rules
+    WHERE rule_subdomain = 'failed_ratio_anomaly'
+);
+
+-- Sıfırlama nedenini logla
+INSERT INTO vce.vce_concept_drift_log
+    (rule_id, rule_domain, rule_subdomain, drift_type, detected_by,
+     drift_reason, reset_performed)
+VALUES (
+    15, 'send_log', 'failed_ratio_anomaly',
+    'manual', 'senin_adin',
+    'Kampanya dönemi — anormal yüksek hacim bekleniyor. Baseline eski veriyle güncel değil.',
+    1
+);
+```
+
+#### Model Performansı — Precision ve False Positive Takibi
+
+**Problem:** Sistem "ANOMALİ TESPİT ETTİM" diyor ama bu gerçek miydi?
+False positive (yanlış alarm) oranı bilinmiyor.
+
+**Çözüm:** `vce_anomaly_feedback` tablosuna geri bildirim verilir:
+
+```sql
+-- "Bu anomali gerçek miydi?" işaretleme
+-- Airflow bildiriminden tespit_id'yi al (vce_dq_executions.id)
+INSERT INTO vce.vce_anomaly_feedback
+    (execution_id, rule_id, rule_domain, rule_subdomain,
+     was_true_anomaly, feedback_by, root_cause, action_taken)
+VALUES (
+    8421,            -- vce_dq_executions.id
+    15,              -- vce_dq_rules.id
+    'send_log', 'failed_ratio_anomaly',
+    1,               -- 1: gerçek anomali, 0: yanlış alarm
+    'senin_adin',
+    'Kampanya e-postası — beklenen yüksek hacim',
+    'Threshold geçici olarak yükseltildi'
+);
+```
+
+`ModelPerformanceOperator` her gün geri bildirimleri toplayarak precision hesaplar:
+
+```sql
+-- Son 30 günlük model performansı
+SELECT rule_subdomain,
+       SUM(anomaly_detected) as toplam_tespit,
+       SUM(true_positives)   as gercek_anomali,
+       SUM(false_positives)  as yanlis_alarm,
+       ROUND(AVG(precision_score) * 100, 1) as precision_pct,
+       SUM(drift_occurred)   as drift_sayisi
+FROM vce.vce_model_performance
+WHERE performance_date >= CURDATE() - INTERVAL 30 DAY
+GROUP BY rule_subdomain
+ORDER BY precision_pct ASC;
+```
+
+---
+
+### Data Product Mindset
+
+Veriyi bir ürün gibi yönet: sahibi var, SLA'i var, kalite eşiği var, tüketicileri var.
+
+#### Data Product Registry
+
+`vce.vce_data_products` tablosu her izlenen tabloyu kayıt altına alır.
+Seed ile 6 MailSender tablosu hazır kayıtlıdır.
+
+Yeni data product eklemek:
+
+```sql
+INSERT INTO vce.vce_data_products (
+    product_name, product_code,
+    schema_name, table_name,
+    owner_name, team,
+    description, data_classification,
+    freshness_sla_hours, quality_threshold, quality_action,
+    sla_description, active_flag, launch_date
+) VALUES (
+    'Kullanıcı Hesapları', 'USER_ACCOUNTS',
+    'aws_mailsender_pro_v3', 'users',
+    'Platform Team', 'Security',
+    'MailSender Pro kullanıcı hesapları ve yetki bilgileri.',
+    'confidential',
+    NULL,    -- freshness SLA yok
+    95.00,   -- minimum kalite skoru %95
+    'alert',
+    'Aktif admin sayısı en az 1 olmalı.',
+    1, CURDATE()
+);
+```
+
+#### Günlük Kalite Skoru
+
+`QualityScoreOperator` her gün 07:00'da her data product için skor hesaplar:
+
+```
+Basit skor    = geçen_kural / toplam_kural × 100
+Ağırlıklı skor = (passed×1.0 + warned×0.5) / toplam × 100
+```
+
+Trend otomatik hesaplanır: `improving` / `stable` / `degrading`
+
+```sql
+-- Son 30 günlük kalite skor trendi
+SELECT score_date, product_code, quality_score, weighted_score,
+       trend, is_below_threshold
+FROM vce.vce_quality_scores
+WHERE product_code = 'SEND_LOG_DAILY'
+  AND score_date >= CURDATE() - INTERVAL 30 DAY
+ORDER BY score_date;
+
+-- Bu hafta eşiğin altına düşen ürünler
+SELECT p.product_name, q.score_date, q.quality_score, q.threshold
+FROM vce.vce_quality_scores q
+JOIN vce.vce_data_products p ON p.id = q.product_id
+WHERE q.is_below_threshold = 1
+  AND q.score_date >= CURDATE() - INTERVAL 7 DAY
+ORDER BY q.quality_score ASC;
+```
+
+#### Freshness SLA
+
+`SLAMonitorOperator` her tablonun son güncelleme zamanını kontrol eder.
+`freshness_sla_hours` süresini geçmişse ihlal kaydı oluşturur.
+
+```sql
+-- Açık SLA ihlalleri
+SELECT v.product_code, v.violation_type, v.delay_hours,
+       v.severity, v.violation_at, v.resolved_at
+FROM vce.vce_sla_violations v
+WHERE v.resolved_at IS NULL
+ORDER BY v.severity DESC, v.violation_at DESC;
+
+-- SLA ihlalini kapat (sorun giderilince)
+UPDATE vce.vce_sla_violations
+SET resolved_at = NOW(),
+    resolution_note = 'Worker yeniden başlatıldı, tablo güncellendi.'
+WHERE id = 42;
+```
+
+#### Haftalık Sağlık Raporu
+
+`mailsender_vce_weekly_report` DAG'ı her Pazartesi 07:00 UTC'de çalışır
+ve Teams/Slack'e şu özeti gönderir:
+
+```
+📊 Haftalık Data Product Sağlık Raporu — 2026-04-20
+
+Data Products: 6 ürün izleniyor
+  ⚠️ Eşik altında olan: 1 ürün
+  📉 Düşüş trendi gösteren: 2 ürün
+  🚨 SLA ihlali: 3
+  🔄 Concept drift: 1
+  ❌ Yüksek false positive: 2 kural
+
+Eşik altındaki ürünler:
+  • SES_NOTIFICATIONS: ort. %88.3
+```
+
+---
+
+### Tam DAG Takvimi (v1.2)
+
+```
+Her ayın 1'i   01:00 UTC  mailsender_vce_partition_manager
+                           → Yeni ay partition'ı ekle, eskiyi düşür
+
+Her gün        03:00 UTC  mailsender_vce_remediation
+                           → Eski tokenları, rate log'ları temizle
+
+Her gün        06:00 UTC  mailsender_vce_main
+                           → 35 kural, 9 domain, anomali tespiti
+
+Her gün        07:00 UTC  mailsender_vce_ml_lifecycle
+                           → Concept drift, model performans,
+                             kalite skoru, freshness SLA
+
+Her Pazartesi  07:00 UTC  mailsender_vce_weekly_report
+                           → Haftalık data product sağlık raporu
+```
+
+### Kurulum (Mevcut Projeye Ekleme)
+
+```bash
+# ML lifecycle tabloları ve 6 hazır data product
+mysql -u root -p vce < sql/04_vce_ml_lifecycle.sql
+
+# Yeni operatör
+cp operators/vce_operators_ml_lifecycle.py  dags/operators/
+
+# Yeni DAG'lar
+cp dags/mailsender_vce_ml_lifecycle.py  /path/to/airflow/dags/
 ```
 

@@ -1,0 +1,34 @@
+[sqlfluff]
+# VCE — SQLFluff Konfigürasyonu
+# SQL dosyalarının otomatik lint kuralları
+
+templater = raw
+dialect = mysql
+max_line_length = 120
+
+# Hariç tutulacak dosya/klasörler
+exclude_rules = L003,L010,L031,L034,L036
+
+[sqlfluff:rules]
+# Anahtar kelimeler büyük harf (CREATE, SELECT, FROM vb.)
+# L010: keyword_capitalisation — kapatıldı (Türkçe yorum satırlarıyla çelişir)
+
+[sqlfluff:rules:L006]
+# Operatörlerin etrafındaki boşluklar
+# single_space_before: True → operatörden önce boşluk
+# single_space_after: True → operatörden sonra boşluk
+
+[sqlfluff:rules:L016]
+# Uzun satır toleransı
+max_line_length = 120
+
+[sqlfluff:rules:L019]
+# Virgül sonrası boşluk
+comma_style = trailing
+
+[sqlfluff:indentation]
+# Girinti stili
+indent_unit = space
+tab_space_size = 4
+indented_joins = False
+indented_using_on = True

@@ -1,0 +1,290 @@
+# =============================================================================
+# VCE — Sürekli Dağıtım (CD) Workflow
+# =============================================================================
+#
+# TETIKLEYICI:
+#   - main branch'e push (CI başarılı olduktan sonra)
+#
+# AŞAMALAR:
+#   1. CI başarılı mı kontrol et
+#   2. Deploy paketi oluştur (ZIP)
+#   3. Airflow sunucusuna deploy et (SSH ile)
+#   4. Airflow DAG'ları yenile
+#   5. Deployment kontrolü (DAG'lar import edildi mi?)
+#   6. Bildirim gönder (Slack/Teams)
+#
+# KURULUM GEREKSİNİMLERİ:
+#   GitHub Repository Secrets'a şunlar eklenmelidir:
+#   (GitHub → Repository → Settings → Secrets and variables → Actions)
+#
+#   AIRFLOW_HOST      : Airflow sunucusunun IP veya hostname'i
+#                       Windows localhost için: host.docker.internal
+#   AIRFLOW_SSH_KEY   : SSH private key (sunucuya bağlanmak için)
+#   AIRFLOW_DAGS_PATH : DAG'ların kopyalanacağı klasör
+#                       Örn: /home/yeliz/apache-airflow-docker/dags
+#   AIRFLOW_API_URL   : Airflow REST API URL'si
+#                       Örn: http://localhost:8080
+#   AIRFLOW_API_USER  : Airflow admin kullanıcı adı
+#   AIRFLOW_API_PASS  : Airflow admin şifresi
+#   TEAMS_WEBHOOK_URL : Deployment bildirimi için (opsiyonel)
+#
+# NOT: Windows localhost için SSH yerine GitHub Actions self-hosted runner
+#      daha pratik olabilir. Alternatif deploy script'i için
+#      tools/deploy_local.ps1 dosyasına bakın.
+# =============================================================================
+
+name: VCE CD Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Sadece bu dosyalar değişince deploy et
+      - "operators/**"
+      - "dags/**"
+      - "sql/**"
+
+# Aynı anda sadece bir deployment çalışsın
+concurrency:
+  group: deployment
+  cancel-in-progress: false  # Deploy iptal edilmez, sıraya alınır
+
+env:
+  PYTHON_VERSION: "3.10"
+  DEPLOY_TIMESTAMP: ${{ github.run_number }}-${{ github.sha }}
+
+jobs:
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AŞAMA 1: Deploy Paketi Oluştur
+  # ══════════════════════════════════════════════════════════════════════════
+  build:
+    name: "📦 Deploy Paketi"
+    runs-on: ubuntu-latest
+
+    outputs:
+      artifact-name: ${{ steps.set-artifact.outputs.name }}
+
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Artifact adını belirle
+        id: set-artifact
+        run: |
+          NAME="vce-deploy-${{ github.sha }}"
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+          echo "Deploy paketi: $NAME"
+
+      - name: Deploy paketini hazırla
+        run: |
+          mkdir -p deploy_package/operators
+
+          # Operatör dosyaları
+          cp operators/vce_operators.py              deploy_package/operators/
+          cp operators/vce_operators_extended.py     deploy_package/operators/
+          cp operators/vce_operators_ml_lifecycle.py deploy_package/operators/
+
+          # DAG dosyaları
+          cp dags/mailsender_vce_main.py              deploy_package/
+          cp dags/mailsender_vce_remediation.py       deploy_package/
+          cp dags/mailsender_vce_partition_manager.py deploy_package/
+          cp dags/mailsender_vce_ml_lifecycle.py      deploy_package/
+
+          # Deploy manifest — ne deploy edildi, ne zaman
+          cat > deploy_package/DEPLOY_MANIFEST.txt << EOF
+          VCE Deploy Manifest
+          ===================
+          Commit  : ${{ github.sha }}
+          Branch  : ${{ github.ref_name }}
+          Tarih   : $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Workflow: ${{ github.run_number }}
+          Tetikleyen: ${{ github.actor }}
+
+          Dosyalar:
+          $(find deploy_package -type f | sort)
+          EOF
+
+          echo "📦 Deploy paketi hazır:"
+          find deploy_package -type f | sort
+
+      - name: Paketi artifact olarak kaydet
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-artifact.outputs.name }}
+          path: deploy_package/
+          retention-days: 30   # 30 gün sakla
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AŞAMA 2: Airflow'a Deploy Et
+  # ══════════════════════════════════════════════════════════════════════════
+  deploy:
+    name: "🚀 Airflow Deploy"
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production   # GitHub Environment koruması (opsiyonel onay)
+
+    steps:
+      - name: Deploy paketini indir
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: deploy_package/
+
+      - name: SSH key hazırla
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AIRFLOW_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Bilinen host olarak ekle (fingerprint uyarısını önle)
+          ssh-keyscan -H ${{ secrets.AIRFLOW_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Hedef klasörü hazırla
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.AIRFLOW_USER }}@${{ secrets.AIRFLOW_HOST }} \
+              "mkdir -p ${{ secrets.AIRFLOW_DAGS_PATH }}/operators"
+
+      - name: Operatörleri kopyala
+        run: |
+          scp -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              deploy_package/operators/*.py \
+              ${{ secrets.AIRFLOW_USER }}@${{ secrets.AIRFLOW_HOST }}:${{ secrets.AIRFLOW_DAGS_PATH }}/operators/
+
+          echo "✅ Operatörler kopyalandı."
+
+      - name: DAG dosyalarını kopyala
+        run: |
+          scp -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              deploy_package/*.py \
+              ${{ secrets.AIRFLOW_USER }}@${{ secrets.AIRFLOW_HOST }}:${{ secrets.AIRFLOW_DAGS_PATH }}/
+
+          echo "✅ DAG dosyaları kopyalandı."
+
+      - name: Airflow DAG'ları yenile
+        run: |
+          # Airflow scheduler DAG'ları otomatik algılar
+          # Ama elle de tetikleyebiliriz
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.AIRFLOW_USER }}@${{ secrets.AIRFLOW_HOST }} \
+              "docker exec airflow-scheduler airflow dags reserialize 2>/dev/null || true"
+
+          echo "✅ Airflow DAG'ları yenilendi."
+
+      - name: SSH key temizle
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AŞAMA 3: Deployment Doğrulama
+  # ══════════════════════════════════════════════════════════════════════════
+  verify:
+    name: "🔎 Deployment Doğrulama"
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    steps:
+      - name: Airflow API ile DAG'ları kontrol et
+        run: |
+          # 30 saniye bekle — scheduler DAG'ları parse etsin
+          sleep 30
+
+          # Beklenen DAG'lar
+          EXPECTED_DAGS=(
+            "mailsender_vce_main"
+            "mailsender_vce_remediation"
+            "mailsender_vce_partition_manager"
+            "mailsender_vce_ml_lifecycle"
+          )
+
+          FAILED=0
+          for dag_id in "${EXPECTED_DAGS[@]}"; do
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -u "${{ secrets.AIRFLOW_API_USER }}:${{ secrets.AIRFLOW_API_PASS }}" \
+              "${{ secrets.AIRFLOW_API_URL }}/api/v1/dags/${dag_id}")
+
+            if [ "$RESPONSE" = "200" ]; then
+              echo "  ✅ $dag_id — aktif"
+            else
+              echo "  ❌ $dag_id — bulunamadı (HTTP $RESPONSE)"
+              FAILED=1
+            fi
+          done
+
+          if [ $FAILED -eq 1 ]; then
+            echo "❌ Bazı DAG'lar Airflow'da bulunamadı!"
+            exit 1
+          else
+            echo "✅ Tüm DAG'lar Airflow'da aktif."
+          fi
+
+      - name: Import hata loglarını kontrol et
+        run: |
+          # Airflow'da import hatası olan DAG var mı?
+          IMPORT_ERRORS=$(curl -s \
+            -u "${{ secrets.AIRFLOW_API_USER }}:${{ secrets.AIRFLOW_API_PASS }}" \
+            "${{ secrets.AIRFLOW_API_URL }}/api/v1/importErrors" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('import_errors',[])))")
+
+          if [ "$IMPORT_ERRORS" -gt "0" ]; then
+            echo "❌ $IMPORT_ERRORS DAG import hatası var!"
+            curl -s \
+              -u "${{ secrets.AIRFLOW_API_USER }}:${{ secrets.AIRFLOW_API_PASS }}" \
+              "${{ secrets.AIRFLOW_API_URL }}/api/v1/importErrors" \
+              | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          for e in d.get('import_errors',[]):
+              print(f'  {e[\"filename\"]}: {e[\"stack_trace\"][:200]}')
+          "
+            exit 1
+          else
+            echo "✅ Import hatası yok."
+          fi
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AŞAMA 4: Deployment Bildirimi
+  # ══════════════════════════════════════════════════════════════════════════
+  notify:
+    name: "📢 Bildirim"
+    runs-on: ubuntu-latest
+    needs: [build, deploy, verify]
+    if: always()   # Başarılı veya başarısız her durumda çalış
+
+    steps:
+      - name: Teams bildirimi gönder
+        if: ${{ secrets.TEAMS_WEBHOOK_URL != '' }}
+        run: |
+          STATUS="${{ needs.verify.result }}"
+          if [ "$STATUS" = "success" ]; then
+            EMOJI="✅"
+            TITLE="VCE Deployment Başarılı"
+            COLOR="00AA00"
+          else
+            EMOJI="❌"
+            TITLE="VCE Deployment Başarısız"
+            COLOR="AA0000"
+          fi
+
+          curl -s -X POST "${{ secrets.TEAMS_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"summary\": \"$TITLE\",
+              \"themeColor\": \"$COLOR\",
+              \"sections\": [{
+                \"activityTitle\": \"$EMOJI $TITLE\",
+                \"facts\": [
+                  {\"name\": \"Branch\",    \"value\": \"${{ github.ref_name }}\"},
+                  {\"name\": \"Commit\",    \"value\": \"${{ github.sha }}\"},
+                  {\"name\": \"Tetikleyen\",\"value\": \"${{ github.actor }}\"},
+                  {\"name\": \"Build\",     \"value\": \"#${{ github.run_number }}\"}
+                ]
+              }]
+            }" || echo "Teams bildirimi gönderilemedi (opsiyonel)"

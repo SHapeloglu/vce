@@ -1,0 +1,475 @@
+# =============================================================================
+# VCE — Sürekli Entegrasyon (CI) Workflow
+# =============================================================================
+#
+# TETIKLEYICILER:
+#   - Her push (tüm branch'ler)
+#   - Her Pull Request (main ve develop'a)
+#
+# AŞAMALAR:
+#   1. lint        — Kod kalitesi (flake8 + black format kontrolü)
+#   2. unit-tests  — 51 unit test (MySQL olmadan, mock ile)
+#   3. sql-check   — SQL dosyaları syntax kontrolü
+#   4. dag-import  — DAG dosyaları import edilebilir mi?
+#   5. security    — Gizli bilgi sızıntısı kontrolü (hardcoded password vb.)
+#
+# NOTLAR:
+#   - Unit testler gerçek MySQL gerektirmez — unittest.mock kullanır
+#   - SQL syntax kontrolü sqlfluff ile yapılır
+#   - DAG import testi minimal Airflow kurulumu gerektirir
+#   - Tüm aşamalar başarılı olmadan merge yapılamaz
+# =============================================================================
+
+name: VCE CI Pipeline
+
+on:
+  push:
+    branches: ["**"]          # Tüm branch'lerde çalış
+  pull_request:
+    branches: [main, develop] # main ve develop'a PR açılınca çalış
+
+# Aynı branch'te birden fazla çalışma varsa eskisini iptal et
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.10"
+  # Airflow minimal kurulum için — gerçek DB bağlantısı gerektirmez
+  AIRFLOW__CORE__UNIT_TEST_MODE: "True"
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "sqlite:////tmp/airflow_test.db"
+  AIRFLOW_HOME: "/tmp/airflow_test"
+  PYTHONPATH: "${{ github.workspace }}"
+
+jobs:
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AŞAMA 1: Kod Kalitesi (Lint)
+  # ══════════════════════════════════════════════════════════════════════════
+  lint:
+    name: "🔍 Lint & Format"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Lint araçlarını kur
+        run: pip install flake8 black isort
+
+      - name: flake8 — Kod kalitesi kontrolü
+        run: |
+          flake8 operators/ dags/ tests/ tools/ \
+            --max-line-length=120 \
+            --extend-ignore=E203,W503 \
+            --exclude=__pycache__,.git \
+            --statistics
+        # E203: slice notation boşluğu (black ile çelişir)
+        # W503: satır sonu binary operator (stilistik tercih)
+
+      - name: black — Format kontrolü
+        run: |
+          black --check --diff \
+            --line-length=120 \
+            operators/ dags/ tests/ tools/
+        # --check: değiştirmez, sadece kontrol eder
+        # --diff: hangi satırların değişeceğini gösterir
+
+      - name: isort — Import sırası kontrolü
+        run: |
+          isort --check-only --diff \
+            --line-length=120 \
+            --profile=black \
+            operators/ dags/ tests/ tools/
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AŞAMA 2: Unit Testler
+  # ══════════════════════════════════════════════════════════════════════════
+  unit-tests:
+    name: "🧪 Unit Tests"
+    runs-on: ubuntu-latest
+    # Lint başarısız olursa testleri çalıştırma
+    needs: lint
+
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Bağımlılıkları kur
+        run: |
+          pip install \
+            apache-airflow==2.9.0 \
+            pymysql \
+            pytest \
+            pytest-mock \
+            pytest-cov \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.0/constraints-3.10.txt"
+
+      - name: Airflow DB başlat (test modu)
+        run: |
+          mkdir -p /tmp/airflow_test
+          airflow db init
+
+      - name: Unit testleri çalıştır
+        run: |
+          pytest tests/test_vce_operators.py \
+            --verbose \
+            --tb=short \
+            --cov=operators \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=70
+        # --cov-fail-under=70: %70 altında coverage → pipeline başarısız
+
+      - name: Coverage raporunu yükle
+        uses: codecov/codecov-action@v4
+        if: always()   # Test başarısız olsa da coverage'ı yükle
+        with:
+          file: coverage.xml
+          fail_ci_if_error: false
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AŞAMA 3: SQL Dosyaları Kontrolü
+  # ══════════════════════════════════════════════════════════════════════════
+  sql-check:
+    name: "🗄️ SQL Validation"
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: sqlfluff kur
+        run: pip install sqlfluff sqlfluff-templater-jinja
+
+      - name: SQL syntax kontrolü
+        run: |
+          sqlfluff lint sql/ \
+            --dialect mysql \
+            --exclude-rules L003,L010,L031,L034,L036 \
+            --max-line-length 120
+        # L003: girinti (SQL'de esnek tutuyoruz)
+        # L010: keyword büyük/küçük harf (Türkçe yorum satırlarıyla çelişir)
+        # L031: alias tanımlama stili
+        # L034: SELECT * kullanımı (bazı schema sorgularında gerekli)
+        # L036: GROUP BY sütun adları
+
+      - name: SQL dosya sırası kontrolü
+        # Dosyalar doğru sırada numaralandırılmış mı?
+        run: |
+          python3 << 'PYEOF'
+          import os, re, sys
+
+          sql_dir = "sql"
+          files = sorted(os.listdir(sql_dir))
+          sql_files = [f for f in files if f.endswith(".sql")]
+
+          errors = []
+          for i, fname in enumerate(sql_files):
+              # 01_, 02_, 03_... formatında olmalı
+              expected_prefix = f"{i+1:02d}_"
+              if not fname.startswith(expected_prefix):
+                  errors.append(
+                      f"  {fname}: '{expected_prefix}' prefix'i bekleniyor"
+                  )
+
+          if errors:
+              print("❌ SQL dosya numaralandırma hatası:")
+              for e in errors:
+                  print(e)
+              sys.exit(1)
+          else:
+              print(f"✅ {len(sql_files)} SQL dosyası doğru sıralandı.")
+          PYEOF
+
+      - name: Schema prefix kontrolü
+        # Seed SQL'lerinde aws_mailsender_pro_v3 prefix'i var mı?
+        run: |
+          python3 << 'PYEOF'
+          import re, sys
+
+          SEED_FILES = ["sql/02_vce_seed_rules.sql", "sql/03_vce_extensions.sql"]
+          SCHEMA_PREFIX = "aws_mailsender_pro_v3"
+          # Bu pattern'lar FROM/JOIN sonrasında schema prefix olmadan tablo adı
+          DANGEROUS = re.compile(
+              r"\b(FROM|JOIN)\s+(?!aws_mailsender_pro_v3\.|vce\.|information_schema\.|tmp_)"
+              r"(send_log|senders|suppression_list|send_queue|users|audit_log|"
+              r"ses_notifications|rate_limit_log|unsubscribe_tokens|"
+              r"password_reset_tokens|send_queue_log|email_verify_jobs)\b",
+              re.IGNORECASE
+          )
+
+          errors = []
+          for fpath in SEED_FILES:
+              try:
+                  with open(fpath) as f:
+                      for lineno, line in enumerate(f, 1):
+                          # Yorum satırlarını atla
+                          stripped = line.strip()
+                          if stripped.startswith("--") or stripped.startswith("#"):
+                              continue
+                          if DANGEROUS.search(line):
+                              errors.append(
+                                  f"  {fpath}:{lineno}: Schema prefix eksik → {line.strip()[:80]}"
+                              )
+              except FileNotFoundError:
+                  pass  # Dosya yoksa atla
+
+          if errors:
+              print("❌ Schema prefix eksikliği tespit edildi:")
+              for e in errors:
+                  print(e)
+              print(f"\nTüm MailSender tabloları '{SCHEMA_PREFIX}.tablo_adi' formatında olmalı.")
+              sys.exit(1)
+          else:
+              print(f"✅ Schema prefix kontrolü geçti.")
+          PYEOF
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AŞAMA 4: DAG Import Testi
+  # ══════════════════════════════════════════════════════════════════════════
+  dag-import:
+    name: "✈️ DAG Import Check"
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Bağımlılıkları kur
+        run: |
+          pip install \
+            apache-airflow==2.9.0 \
+            pymysql \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.0/constraints-3.10.txt"
+
+      - name: Airflow DB başlat
+        run: |
+          mkdir -p /tmp/airflow_test
+          airflow db init
+
+      - name: DAG dosyalarını import et
+        # Her DAG dosyasının Python syntax'ı ve import'ları doğru mu?
+        run: |
+          python3 << 'PYEOF'
+          import sys, os, importlib.util, traceback
+
+          # dags/ klasöründeki tüm Python dosyaları
+          dag_dir = "dags"
+          dag_files = [
+              f for f in os.listdir(dag_dir)
+              if f.endswith(".py") and not f.startswith("__")
+          ]
+
+          # operators/ klasörünü path'e ekle (import için)
+          sys.path.insert(0, os.path.abspath("."))
+          sys.path.insert(0, os.path.abspath("dags"))
+
+          errors = []
+          success = []
+
+          for fname in sorted(dag_files):
+              fpath = os.path.join(dag_dir, fname)
+              try:
+                  spec = importlib.util.spec_from_file_location(
+                      fname.replace(".py", ""), fpath
+                  )
+                  module = importlib.util.module_from_spec(spec)
+                  spec.loader.exec_module(module)
+                  success.append(fname)
+                  print(f"  ✅ {fname}")
+              except Exception as e:
+                  errors.append(fname)
+                  print(f"  ❌ {fname}: {e}")
+                  traceback.print_exc()
+
+          print(f"\nSonuç: {len(success)} başarılı, {len(errors)} hatalı")
+
+          if errors:
+              print(f"\n❌ Import hatası olan DAG'lar: {errors}")
+              sys.exit(1)
+          else:
+              print(f"\n✅ Tüm {len(success)} DAG import testi geçti.")
+          PYEOF
+
+      - name: DAG sayısı kontrolü
+        # Beklenen DAG sayısı mevcut mu?
+        run: |
+          python3 << 'PYEOF'
+          import os
+
+          EXPECTED_DAGS = {
+              "mailsender_vce_main.py",
+              "mailsender_vce_remediation.py",
+              "mailsender_vce_partition_manager.py",
+              "mailsender_vce_ml_lifecycle.py",
+          }
+
+          actual = {
+              f for f in os.listdir("dags")
+              if f.endswith(".py") and not f.startswith("__")
+          }
+
+          missing = EXPECTED_DAGS - actual
+          if missing:
+              print(f"❌ Eksik DAG dosyaları: {missing}")
+              raise SystemExit(1)
+          else:
+              print(f"✅ Tüm beklenen {len(EXPECTED_DAGS)} DAG mevcut.")
+          PYEOF
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # AŞAMA 5: Güvenlik Kontrolü
+  # ══════════════════════════════════════════════════════════════════════════
+  security:
+    name: "🔒 Security Check"
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Güvenlik araçlarını kur
+        run: pip install bandit detect-secrets
+
+      - name: bandit — Python güvenlik taraması
+        run: |
+          bandit -r operators/ dags/ tools/ \
+            --severity-level medium \
+            --confidence-level medium \
+            --exclude tests/ \
+            -f txt
+        # SQL injection, hardcoded password, insecure random vb. tespiti
+
+      - name: detect-secrets — Gizli bilgi sızıntısı
+        run: |
+          # Önce baseline oluştur (ilk çalıştırmada)
+          detect-secrets scan \
+            --exclude-files "\.git/.*" \
+            --exclude-files "tests/.*" \
+            --exclude-files ".*\.md" \
+            > /tmp/secrets_scan.json
+
+          # Herhangi bir secret bulundu mu?
+          python3 << 'PYEOF'
+          import json, sys
+
+          with open("/tmp/secrets_scan.json") as f:
+              result = json.load(f)
+
+          results = result.get("results", {})
+          if results:
+              print("❌ Potansiyel gizli bilgi sızıntısı tespit edildi:")
+              for fpath, secrets in results.items():
+                  for s in secrets:
+                      print(f"  {fpath}:{s['line_number']} — {s['type']}")
+              print("\nAirflow Variable kullanın, kodda gizli bilgi bırakmayın.")
+              sys.exit(1)
+          else:
+              print("✅ Gizli bilgi sızıntısı tespit edilmedi.")
+          PYEOF
+
+      - name: Hardcoded webhook URL kontrolü
+        run: |
+          python3 << 'PYEOF'
+          import re, os, sys, glob
+
+          # Webhook URL pattern'ları
+          PATTERNS = [
+              r'hooks\.slack\.com/services/[A-Z0-9/]+',
+              r'webhook\.office\.com/webhookb2/[a-f0-9-]+',
+              r'discord\.com/api/webhooks/\d+/',
+          ]
+
+          errors = []
+          for fpath in glob.glob("operators/**/*.py", recursive=True) + \
+                       glob.glob("dags/**/*.py", recursive=True):
+              with open(fpath) as f:
+                  for lineno, line in enumerate(f, 1):
+                      # Yorum satırlarını atla
+                      if line.strip().startswith("#"):
+                          continue
+                      for pattern in PATTERNS:
+                          if re.search(pattern, line):
+                              errors.append(f"  {fpath}:{lineno}: Hardcoded webhook URL")
+
+          if errors:
+              print("❌ Hardcoded webhook URL bulundu:")
+              for e in errors:
+                  print(e)
+              print("\nAirflow Variable kullanın: Variable.get('VCE_TEAMS_WEBHOOK_URL')")
+              sys.exit(1)
+          else:
+              print("✅ Hardcoded webhook URL yok.")
+          PYEOF
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # ÖZET: Tüm aşamalar başarılı mı?
+  # ══════════════════════════════════════════════════════════════════════════
+  ci-complete:
+    name: "✅ CI Tamamlandı"
+    runs-on: ubuntu-latest
+    needs: [lint, unit-tests, sql-check, dag-import, security]
+    if: always()
+
+    steps:
+      - name: CI sonucu
+        run: |
+          if [ "${{ needs.lint.result }}"       = "success" ] && \
+             [ "${{ needs.unit-tests.result }}" = "success" ] && \
+             [ "${{ needs.sql-check.result }}"  = "success" ] && \
+             [ "${{ needs.dag-import.result }}" = "success" ] && \
+             [ "${{ needs.security.result }}"   = "success" ]; then
+            echo "✅ Tüm CI aşamaları başarıyla tamamlandı."
+            echo "   Lint:       ${{ needs.lint.result }}"
+            echo "   Unit Tests: ${{ needs.unit-tests.result }}"
+            echo "   SQL Check:  ${{ needs.sql-check.result }}"
+            echo "   DAG Import: ${{ needs.dag-import.result }}"
+            echo "   Security:   ${{ needs.security.result }}"
+          else
+            echo "❌ CI başarısız:"
+            echo "   Lint:       ${{ needs.lint.result }}"
+            echo "   Unit Tests: ${{ needs.unit-tests.result }}"
+            echo "   SQL Check:  ${{ needs.sql-check.result }}"
+            echo "   DAG Import: ${{ needs.dag-import.result }}"
+            echo "   Security:   ${{ needs.security.result }}"
+            exit 1
+          fi

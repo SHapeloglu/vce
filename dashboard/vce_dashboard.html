@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VCE Dashboard — MailSender Pro Veri Kalitesi</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  /* ── Reset & Base ── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg       : #0f1117;
+    --surface  : #1a1d27;
+    --surface2 : #22263a;
+    --border   : rgba(255,255,255,0.08);
+    --text     : #e2e8f0;
+    --muted    : #8892a4;
+    --pass     : #22c55e;
+    --warn     : #f59e0b;
+    --fail     : #ef4444;
+    --blue     : #3b82f6;
+    --purple   : #8b5cf6;
+    --radius   : 12px;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+
+  /* ── Layout ── */
+  .header {
+    padding: 24px 32px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  .header h1 {
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -0.3px;
+  }
+
+  .header .subtitle { color: var(--muted); font-size: 13px; margin-top: 2px; }
+
+  .db-config {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .db-config input {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    padding: 7px 12px;
+    font-size: 13px;
+    outline: none;
+    width: 160px;
+  }
+
+  .db-config input:focus { border-color: var(--blue); }
+
+  .btn {
+    background: var(--blue);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: opacity .15s;
+  }
+  .btn:hover { opacity: .85; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn.secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+
+  .main { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
+
+  /* ── Status Bar ── */
+  .status-bar {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 20px;
+  }
+
+  .stat-card .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+  .stat-card .value.pass  { color: var(--pass); }
+  .stat-card .value.warn  { color: var(--warn); }
+  .stat-card .value.fail  { color: var(--fail); }
+  .stat-card .value.blue  { color: var(--blue); }
+  .stat-card .meta        { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  /* ── Grid ── */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  @media (max-width: 900px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+
+  /* ── Card ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+  }
+  .card h3 { font-size: 14px; font-weight: 600; margin-bottom: 14px; color: var(--text); }
+
+  /* ── Table ── */
+  .tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .tbl th { color: var(--muted); font-weight: 500; text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .tbl td { padding: 8px 8px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+  .tbl tr:last-child td { border-bottom: none; }
+  .tbl tr:hover td { background: var(--surface2); }
+
+  /* ── Badge ── */
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+  .badge.pass { background: rgba(34,197,94,.15); color: var(--pass); }
+  .badge.warn { background: rgba(245,158,11,.15); color: var(--warn); }
+  .badge.fail { background: rgba(239,68,68,.15); color: var(--fail); }
+  .badge.info { background: rgba(59,130,246,.15); color: var(--blue); }
+
+  /* ── Chart container ── */
+  .chart-wrap { position: relative; height: 220px; }
+
+  /* ── Domain tiles ── */
+  .domain-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+  .domain-tile {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    cursor: pointer;
+    transition: border-color .15s;
+  }
+  .domain-tile:hover { border-color: var(--blue); }
+  .domain-tile .d-name  { font-weight: 600; font-size: 13px; }
+  .domain-tile .d-count { font-size: 12px; color: var(--muted); margin-top: 3px; }
+  .domain-tile .d-status-bar {
+    height: 4px;
+    border-radius: 2px;
+    margin-top: 10px;
+    background: var(--border);
+    overflow: hidden;
+  }
+  .domain-tile .d-status-bar span { display: block; height: 100%; transition: width .4s; }
+
+  /* ── Loader ── */
+  .loader { text-align: center; color: var(--muted); padding: 40px; }
+  .spinner {
+    display: inline-block; width: 20px; height: 20px;
+    border: 2px solid var(--border);
+    border-top-color: var(--blue);
+    border-radius: 50%;
+    animation: spin .6s linear infinite;
+    margin-right: 8px; vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Tabs ── */
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .tab {
+    padding: 8px 16px; border: none; background: none;
+    color: var(--muted); cursor: pointer; font-size: 13px;
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+    transition: color .15s, border-color .15s;
+  }
+  .tab.active { color: var(--text); border-color: var(--blue); }
+
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  .empty { text-align: center; color: var(--muted); padding: 32px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>VCE — Veri Kalitesi Dashboard</h1>
+    <div class="subtitle">MailSender Pro · MySQL · Apache Airflow</div>
+  </div>
+  <div class="db-config">
+    <!--
+      NOT: Bu dashboard MySQL'e doğrudan bağlanamaz (tarayıcı güvenliği).
+      Üretimde Airflow'un bir API endpoint'i veya küçük bir Flask/FastAPI servisi
+      vce_dq_executions tablosundan JSON veri servisi olarak kullanılmalıdır.
+
+      Şimdilik demo verisiyle çalışır. "Veri Yükle" ile gerçek JSON paste edebilirsiniz.
+    -->
+    <button class="btn secondary" onclick="loadDemoData()">Demo Veri</button>
+    <button class="btn" onclick="loadFromClipboard()">JSON Yapıştır</button>
+    <button class="btn secondary" onclick="exportReport()">Rapor İndir</button>
+    <span id="last-refresh" style="color:var(--muted);font-size:12px"></span>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- Status Bar -->
+  <div class="status-bar" id="status-bar">
+    <div class="stat-card">
+      <div class="label">Toplam Kontrol</div>
+      <div class="value blue" id="stat-total">—</div>
+      <div class="meta">son 24 saat</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Geçti</div>
+      <div class="value pass" id="stat-pass">—</div>
+      <div class="meta" id="stat-pass-pct">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Uyarı</div>
+      <div class="value warn" id="stat-warn">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Başarısız</div>
+      <div class="value fail" id="stat-fail">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Genel Durum</div>
+      <div class="value" id="stat-status">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Son Çalışma</div>
+      <div class="value blue" style="font-size:16px" id="stat-last-run">—</div>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('overview')">Genel Bakış</button>
+    <button class="tab" onclick="switchTab('details')">Detay Loglar</button>
+    <button class="tab" onclick="switchTab('trends')">Trend Analizi</button>
+    <button class="tab" onclick="switchTab('remediation')">Temizlik Logları</button>
+  </div>
+
+  <!-- TAB: Overview -->
+  <div id="tab-overview" class="tab-content active">
+    <div class="grid-2">
+      <div class="card">
+        <h3>Son 7 Günlük Durum Trendi</h3>
+        <div class="chart-wrap"><canvas id="trend-chart"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>Domain Başarı Oranı</h3>
+        <div class="chart-wrap"><canvas id="domain-chart"></canvas></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Domain Bazlı Özet</h3>
+      <div class="domain-grid" id="domain-tiles">
+        <div class="empty">Veri yükleyin</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB: Details -->
+  <div id="tab-details" class="tab-content">
+    <div class="card">
+      <div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;align-items:center">
+        <h3 style="margin:0">Kontrol Sonuçları</h3>
+        <select id="filter-domain" onchange="renderDetails()" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px 10px;font-size:13px">
+          <option value="">Tüm domainler</option>
+        </select>
+        <select id="filter-status" onchange="renderDetails()" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px 10px;font-size:13px">
+          <option value="">Tüm sonuçlar</option>
+          <option value="Failed">Başarısız</option>
+          <option value="Passed">Geçti</option>
+        </select>
+      </div>
+      <table class="tbl">
+        <thead>
+          <tr>
+            <th>Zaman</th>
+            <th>Domain</th>
+            <th>Alt Domain</th>
+            <th>Tip</th>
+            <th>Değer</th>
+            <th>Durum</th>
+            <th>Aksiyon</th>
+          </tr>
+        </thead>
+        <tbody id="detail-tbody">
+          <tr><td colspan="7" class="empty">Veri yükleyin</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- TAB: Trends -->
+  <div id="tab-trends" class="tab-content">
+    <div class="grid-2">
+      <div class="card">
+        <h3>send_log Başarısız Oranı (7 Gün)</h3>
+        <div class="chart-wrap"><canvas id="fail-ratio-chart"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>Suppression Artışı (7 Gün)</h3>
+        <div class="chart-wrap"><canvas id="suppression-chart"></canvas></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Anomali Tespiti — Z-Skoru Geçmişi</h3>
+      <table class="tbl" id="anomaly-table">
+        <thead>
+          <tr><th>Zaman</th><th>Domain</th><th>Değer</th><th>Ortalama</th><th>Z-Skoru</th><th>Durum</th></tr>
+        </thead>
+        <tbody id="anomaly-tbody">
+          <tr><td colspan="6" class="empty">Anomali verisi yükleyin</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- TAB: Remediation -->
+  <div id="tab-remediation" class="tab-content">
+    <div class="card">
+      <h3>Temizlik İşlemleri Geçmişi</h3>
+      <table class="tbl">
+        <thead>
+          <tr><th>Zaman</th><th>İşlem</th><th>Tablo</th><th>Etkilenen Satır</th><th>Durum</th></tr>
+        </thead>
+        <tbody id="remediation-tbody">
+          <tr><td colspan="5" class="empty">Remediation verisi yükleyin</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────────
+let state = { executions: [], remediations: [], lastRun: null };
+let trendChart, domainChart, failRatioChart, suppressionChart;
+
+// ── Tab yönetimi ─────────────────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    const tabs = ['overview','details','trends','remediation'];
+    t.classList.toggle('active', tabs[i] === name);
+  });
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+}
+
+// ── Demo veri ────────────────────────────────────────────────────────────────
+function loadDemoData() {
+  const now = new Date();
+  const executions = [];
+  const domains = [
+    { d:'schema',     s:'missing_tables',         type:'threshold', action:'fail'  },
+    { d:'security',   s:'no_active_admin',         type:'threshold', action:'fail'  },
+    { d:'security',   s:'brute_force_detection',   type:'threshold', action:'warn'  },
+    { d:'send_log',   s:'failed_ratio_threshold',  type:'threshold', action:'fail'  },
+    { d:'send_log',   s:'failed_ratio_anomaly',    type:'anomaly',   action:'warn'  },
+    { d:'send_log',   s:'null_critical_fields',    type:'threshold', action:'fail'  },
+    { d:'send_log',   s:'spam_risk',               type:'threshold', action:'warn'  },
+    { d:'suppression','s':'violation_critical',    type:'threshold', action:'fail'  },
+    { d:'suppression','s':'daily_growth_anomaly',  type:'anomaly',   action:'warn'  },
+    { d:'queue',      s:'stuck_running',           type:'threshold', action:'warn'  },
+    { d:'queue',      s:'count_inconsistency',     type:'threshold', action:'fail'  },
+    { d:'verify',     s:'stuck_jobs',              type:'threshold', action:'warn'  },
+    { d:'senders',    s:'no_active_sender',        type:'threshold', action:'fail'  },
+    { d:'senders',    s:'high_failure_rate',       type:'threshold', action:'warn'  },
+    { d:'integrity',  s:'send_log_orphan',         type:'threshold', action:'fail'  },
+    { d:'freshness',  s:'audit_log_stale',         type:'freshness', action:'warn'  },
+  ];
+
+  // 7 günlük geçmiş oluştur
+  for (let day = 6; day >= 0; day--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - day);
+    domains.forEach(rule => {
+      const isFail = day === 0 && ['send_log/failed_ratio_threshold','queue/count_inconsistency'].includes(rule.d+'/'+rule.s);
+      const isWarn = day === 0 && ['suppression/daily_growth_anomaly','senders/high_failure_rate'].includes(rule.d+'/'+rule.s);
+      const val = isFail ? (Math.random()*10+1).toFixed(2) : '0.00';
+      const z = rule.type === 'anomaly' ? (isFail ? (Math.random()*2+3).toFixed(2) : (Math.random()*1.5).toFixed(2)) : null;
+      executions.push({
+        run_date    : d.toISOString(),
+        rule_domain : rule.d,
+        rule_subdomain: rule.s,
+        check_type  : rule.type,
+        action      : rule.action,
+        result_value: val,
+        result_status: isFail ? 'Failed' : 'Passed',
+        baseline_mean: z ? (Math.random()*5+2).toFixed(2) : null,
+        z_score     : z,
+      });
+    });
+  }
+
+  const remediations = [
+    { executed_at: now.toISOString(), operation_type:'delete_expired_tokens', target_table:'password_reset_tokens', rows_affected:142, result_status:'Success' },
+    { executed_at: now.toISOString(), operation_type:'delete_old_rate_logs',   target_table:'rate_limit_log',        rows_affected:8931,result_status:'Success' },
+    { executed_at: now.toISOString(), operation_type:'delete_expired_unsub',   target_table:'unsubscribe_tokens',    rows_affected:37,  result_status:'Success' },
+    { executed_at: now.toISOString(), operation_type:'delete_old_ses_notif',   target_table:'ses_notifications',     rows_affected:512, result_status:'Success' },
+  ];
+
+  loadData({ executions, remediations });
+}
+
+// ── JSON clipboard ────────────────────────────────────────────────────────────
+async function loadFromClipboard() {
+  try {
+    const text = await navigator.clipboard.readText();
+    const data = JSON.parse(text);
+    loadData(data);
+  } catch(e) {
+    alert('Panoya geçerli JSON yapıştırın.\nFormat: { "executions": [...], "remediations": [...] }');
+  }
+}
+
+// ── Veri yükleme ──────────────────────────────────────────────────────────────
+function loadData(data) {
+  state.executions   = data.executions   || [];
+  state.remediations = data.remediations || [];
+  state.lastRun = new Date().toLocaleTimeString('tr-TR');
+  document.getElementById('last-refresh').textContent = 'Son yenileme: ' + state.lastRun;
+  renderAll();
+}
+
+function renderAll() {
+  renderStatusBar();
+  renderDomainTiles();
+  renderDetails();
+  renderTrendChart();
+  renderDomainChart();
+  renderAnomalyTable();
+  renderRemediationTable();
+  populateFilters();
+}
+
+// ── Status Bar ────────────────────────────────────────────────────────────────
+function renderStatusBar() {
+  const exec = state.executions;
+  const today = exec.filter(e => new Date(e.run_date) > new Date(Date.now() - 86400000));
+  const pass  = today.filter(e => e.result_status === 'Passed').length;
+  const fail  = today.filter(e => e.result_status === 'Failed').length;
+  const warn  = today.filter(e => e.result_status === 'Failed' && e.action === 'warn').length;
+  const total = today.length;
+
+  document.getElementById('stat-total').textContent = total;
+  document.getElementById('stat-pass').textContent  = pass;
+  document.getElementById('stat-fail').textContent  = fail;
+  document.getElementById('stat-warn').textContent  = warn;
+  document.getElementById('stat-pass-pct').textContent = total ? Math.round(pass/total*100)+'% geçti' : '';
+
+  const el = document.getElementById('stat-status');
+  if (fail - warn > 0) {
+    el.textContent = '❌ FAIL'; el.className = 'value fail';
+  } else if (warn > 0) {
+    el.textContent = '⚠️ WARN'; el.className = 'value warn';
+  } else {
+    el.textContent = '✅ PASS'; el.className = 'value pass';
+  }
+
+  const last = exec.length ? new Date(exec[exec.length-1].run_date).toLocaleString('tr-TR') : '—';
+  document.getElementById('stat-last-run').textContent = last;
+}
+
+// ── Domain Tiles ─────────────────────────────────────────────────────────────
+function renderDomainTiles() {
+  const today = state.executions.filter(e => new Date(e.run_date) > new Date(Date.now() - 86400000));
+  const byDomain = {};
+  today.forEach(e => {
+    if (!byDomain[e.rule_domain]) byDomain[e.rule_domain] = { pass:0, fail:0, warn:0 };
+    if (e.result_status === 'Passed') byDomain[e.rule_domain].pass++;
+    else if (e.action === 'fail') byDomain[e.rule_domain].fail++;
+    else byDomain[e.rule_domain].warn++;
+  });
+
+  const container = document.getElementById('domain-tiles');
+  if (!Object.keys(byDomain).length) { container.innerHTML = '<div class="empty">Veri yükleyin</div>'; return; }
+
+  container.innerHTML = Object.entries(byDomain).map(([domain, counts]) => {
+    const total = counts.pass + counts.fail + counts.warn;
+    const pct   = total ? Math.round(counts.pass/total*100) : 0;
+    const color = counts.fail > 0 ? 'var(--fail)' : counts.warn > 0 ? 'var(--warn)' : 'var(--pass)';
+    return `<div class="domain-tile" onclick="filterByDomain('${domain}')">
+      <div class="d-name">${domain}</div>
+      <div class="d-count">${counts.pass}/${total} geçti</div>
+      <div class="d-status-bar"><span style="width:${pct}%;background:${color}"></span></div>
+    </div>`;
+  }).join('');
+}
+
+function filterByDomain(domain) {
+  document.getElementById('filter-domain').value = domain;
+  switchTab('details');
+  renderDetails();
+}
+
+// ── Detail Table ──────────────────────────────────────────────────────────────
+function renderDetails() {
+  const domainFilter = document.getElementById('filter-domain').value;
+  const statusFilter = document.getElementById('filter-status').value;
+
+  let rows = [...state.executions].reverse().slice(0, 200);
+  if (domainFilter) rows = rows.filter(e => e.rule_domain === domainFilter);
+  if (statusFilter) rows = rows.filter(e => e.result_status === statusFilter);
+
+  const tbody = document.getElementById('detail-tbody');
+  if (!rows.length) { tbody.innerHTML = '<tr><td colspan="7" class="empty">Sonuç bulunamadı</td></tr>'; return; }
+
+  tbody.innerHTML = rows.map(e => {
+    const st = e.result_status === 'Passed' ? 'pass' : (e.action==='warn' ? 'warn' : 'fail');
+    const dt = new Date(e.run_date).toLocaleString('tr-TR');
+    const val = parseFloat(e.result_value||0).toFixed(2);
+    return `<tr>
+      <td style="color:var(--muted);font-size:12px">${dt}</td>
+      <td>${e.rule_domain}</td>
+      <td style="color:var(--muted)">${e.rule_subdomain}</td>
+      <td><span class="badge info">${e.check_type}</span></td>
+      <td>${val}${e.z_score ? ` <span style="color:var(--muted);font-size:11px">(z=${parseFloat(e.z_score).toFixed(2)})</span>` : ''}</td>
+      <td><span class="badge ${st}">${e.result_status}</span></td>
+      <td><span class="badge ${e.action==='fail'?'fail':'warn'}">${e.action}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Filter dropdown populate ──────────────────────────────────────────────────
+function populateFilters() {
+  const domains = [...new Set(state.executions.map(e => e.rule_domain))];
+  const sel = document.getElementById('filter-domain');
+  sel.innerHTML = '<option value="">Tüm domainler</option>' +
+    domains.map(d => `<option value="${d}">${d}</option>`).join('');
+}
+
+// ── Charts ────────────────────────────────────────────────────────────────────
+const chartDefaults = {
+  responsive: true,
+  maintainAspectRatio: false,
+  plugins: { legend: { labels: { color: '#8892a4', font: { size: 12 } } } },
+  scales: {
+    x: { ticks: { color: '#8892a4', font: { size: 11 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
+    y: { ticks: { color: '#8892a4', font: { size: 11 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
+  }
+};
+
+function renderTrendChart() {
+  // Son 7 güne göre günlük pass/fail sayısı
+  const days = Array.from({length:7}, (_,i) => {
+    const d = new Date(); d.setDate(d.getDate() - (6-i));
+    return d.toLocaleDateString('tr-TR', {day:'2-digit',month:'2-digit'});
+  });
+
+  const passData = days.map((_, i) => {
+    const d = new Date(); d.setDate(d.getDate() - (6-i));
+    const ds = d.toDateString();
+    return state.executions.filter(e => new Date(e.run_date).toDateString() === ds && e.result_status === 'Passed').length;
+  });
+  const failData = days.map((_, i) => {
+    const d = new Date(); d.setDate(d.getDate() - (6-i));
+    const ds = d.toDateString();
+    return state.executions.filter(e => new Date(e.run_date).toDateString() === ds && e.result_status === 'Failed').length;
+  });
+
+  if (trendChart) trendChart.destroy();
+  trendChart = new Chart(document.getElementById('trend-chart').getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels: days,
+      datasets: [
+        { label: 'Geçti', data: passData, backgroundColor: 'rgba(34,197,94,0.5)', borderColor: '#22c55e', borderWidth: 1 },
+        { label: 'Başarısız', data: failData, backgroundColor: 'rgba(239,68,68,0.5)', borderColor: '#ef4444', borderWidth: 1 },
+      ]
+    },
+    options: { ...chartDefaults, scales: { ...chartDefaults.scales, x: { ...chartDefaults.scales.x, stacked: false } } }
+  });
+}
+
+function renderDomainChart() {
+  const today = state.executions.filter(e => new Date(e.run_date) > new Date(Date.now() - 86400000));
+  const byDomain = {};
+  today.forEach(e => {
+    if (!byDomain[e.rule_domain]) byDomain[e.rule_domain] = { pass:0, fail:0 };
+    if (e.result_status === 'Passed') byDomain[e.rule_domain].pass++;
+    else byDomain[e.rule_domain].fail++;
+  });
+
+  const labels  = Object.keys(byDomain);
+  const passArr = labels.map(l => byDomain[l].pass);
+  const failArr = labels.map(l => byDomain[l].fail);
+
+  if (domainChart) domainChart.destroy();
+  domainChart = new Chart(document.getElementById('domain-chart').getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Geçti',       data: passArr, backgroundColor: 'rgba(34,197,94,0.6)'  },
+        { label: 'Başarısız',   data: failArr, backgroundColor: 'rgba(239,68,68,0.6)'  },
+      ]
+    },
+    options: { ...chartDefaults, indexAxis: 'y' }
+  });
+}
+
+// ── Anomaly Table ─────────────────────────────────────────────────────────────
+function renderAnomalyTable() {
+  const rows = state.executions
+    .filter(e => e.check_type === 'anomaly' && e.z_score != null)
+    .reverse().slice(0, 50);
+
+  const tbody = document.getElementById('anomaly-tbody');
+  if (!rows.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">Anomali kaydı yok</td></tr>'; return; }
+
+  tbody.innerHTML = rows.map(e => {
+    const z   = parseFloat(e.z_score);
+    const abs = Math.abs(z);
+    const cls = abs > 3 ? 'fail' : abs > 2 ? 'warn' : 'pass';
+    return `<tr>
+      <td style="color:var(--muted);font-size:12px">${new Date(e.run_date).toLocaleString('tr-TR')}</td>
+      <td>${e.rule_domain}/${e.rule_subdomain}</td>
+      <td>${parseFloat(e.result_value).toFixed(2)}</td>
+      <td>${e.baseline_mean ? parseFloat(e.baseline_mean).toFixed(2) : '—'}</td>
+      <td><span class="badge ${cls}">${z.toFixed(2)}</span></td>
+      <td><span class="badge ${e.result_status==='Passed'?'pass':'fail'}">${e.result_status}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Remediation Table ─────────────────────────────────────────────────────────
+function renderRemediationTable() {
+  const tbody = document.getElementById('remediation-tbody');
+  if (!state.remediations.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">Veri yükleyin</td></tr>'; return; }
+
+  tbody.innerHTML = state.remediations.map(r => `<tr>
+    <td style="color:var(--muted);font-size:12px">${new Date(r.executed_at).toLocaleString('tr-TR')}</td>
+    <td>${r.operation_type}</td>
+    <td style="color:var(--muted)">${r.target_table}</td>
+    <td>${r.rows_affected}</td>
+    <td><span class="badge ${r.result_status==='Success'?'pass':'fail'}">${r.result_status}</span></td>
+  </tr>`).join('');
+}
+
+// ── Export ────────────────────────────────────────────────────────────────────
+function exportReport() {
+  const report = {
+    generated_at : new Date().toISOString(),
+    summary      : {
+      total    : state.executions.length,
+      passed   : state.executions.filter(e=>e.result_status==='Passed').length,
+      failed   : state.executions.filter(e=>e.result_status==='Failed').length,
+    },
+    executions   : state.executions,
+    remediations : state.remediations,
+  };
+  const blob = new Blob([JSON.stringify(report, null, 2)], {type:'application/json'});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = `vce_report_${new Date().toISOString().slice(0,10)}.json`;
+  a.click(); URL.revokeObjectURL(url);
+}
+
+// İlk yüklemede demo verisi göster
+loadDemoData();
+</script>
+</body>
+</html>

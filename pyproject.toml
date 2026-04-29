@@ -1,0 +1,76 @@
+# =============================================================================
+# pyproject.toml — VCE Proje Konfigürasyonu
+# =============================================================================
+# Black, isort, pytest ve diğer araçların ayarları tek dosyada.
+
+[tool.black]
+# Kod formatlayıcı ayarları
+line-length = 120
+target-version = ["py39", "py310"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+    \.git
+  | __pycache__
+  | \.venv
+)/
+'''
+
+[tool.isort]
+# Import sıralama ayarları
+profile = "black"
+line_length = 120
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+known_first_party = ["operators"]
+known_third_party = ["airflow", "pymysql", "requests"]
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+
+[tool.pytest.ini_options]
+# Pytest ayarları
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--verbose",
+    "--tb=short",
+    "--strict-markers",
+]
+markers = [
+    "unit: Birim testler (MySQL gerektirmez)",
+    "integration: Entegrasyon testleri (MySQL gerektirir)",
+    "slow: Yavaş testler",
+]
+
+[tool.coverage.run]
+# Coverage ayarları
+source = ["operators"]
+omit = [
+    "tests/*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+# Coverage raporlama
+show_missing = true
+skip_covered = false
+fail_under = 70    # %70 altında CI başarısız
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@abstractmethod",
+]
+
+[tool.bandit]
+# Güvenlik taraması ayarları
+exclude_dirs = ["tests", ".git"]
+skips = [
+    "B101",   # assert kullanımı (testlerde normal)
+    "B601",   # paramiko shell (SSH için)
+]

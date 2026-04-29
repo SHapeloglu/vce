@@ -40,6 +40,7 @@
 - [Orijinal VCE ile Farklar](#orijinal-vce-ile-farklar)
 - [Sorun Giderme](#sorun-giderme)
 - [Katkıda Bulunma](#katkıda-bulunma)
+- [CI/CD Pipeline](#cicd-pipeline)
 - [Neden Soda Core Değil?](#neden-soda-core-değil)
 - [Great Expectations ve Soda'dan İlham Alınan Eklemeler](#great-expectations-ve-sodadan-ilham-alınan-eklemeler)
 - [ML Lifecycle ve Data Product Mindset](#ml-lifecycle-ve-data-product-mindset)
@@ -2057,5 +2058,143 @@ cp operators/vce_operators_ml_lifecycle.py  dags/operators/
 
 # Yeni DAG'lar
 cp dags/mailsender_vce_ml_lifecycle.py  /path/to/airflow/dags/
+```
+
+
+---
+
+## CI/CD Pipeline
+
+---
+
+### Genel Bakış
+
+```
+Developer → git push → GitHub Actions
+                           │
+                    ┌──────▼──────┐
+                    │  CI Pipeline │  (her push'ta)
+                    │             │
+                    │  1. Lint    │ → flake8 + black + isort
+                    │  2. Tests   │ → 51 unit test (MySQL'siz)
+                    │  3. SQL     │ → syntax + schema prefix kontrolü
+                    │  4. DAG     │ → import testi
+                    │  5. Security│ → bandit + hardcoded secret taraması
+                    └──────┬──────┘
+                           │ Başarılı + main branch'e push
+                    ┌──────▼──────┐
+                    │  CD Pipeline │
+                    │             │
+                    │  1. Paket   │ → deploy paketi oluştur
+                    │  2. Deploy  │ → SSH ile Airflow'a kopyala
+                    │  3. Doğrula │ → Airflow API ile DAG kontrolü
+                    │  4. Bildir  │ → Teams bildirimi
+                    └─────────────┘
+```
+
+---
+
+### CI — Sürekli Entegrasyon
+
+`.github/workflows/ci.yml` — her push'ta otomatik çalışır.
+
+**5 Aşama:**
+
+| Aşama | Araç | Ne Kontrol Eder |
+|-------|------|----------------|
+| Lint | flake8 + black + isort | Kod kalitesi, format, import sırası |
+| Unit Tests | pytest + pytest-mock | 51 test, MySQL olmadan |
+| SQL Check | sqlfluff + özel script | Syntax, schema prefix, dosya sırası |
+| DAG Import | Python importlib | Her DAG import edilebilir mi? |
+| Security | bandit + detect-secrets | Güvenlik açığı, hardcoded gizli bilgi |
+
+**CI başarısız olursa merge yapılamaz.**
+
+---
+
+### CD — Sürekli Dağıtım
+
+`.github/workflows/cd.yml` — sadece `main` branch'e push olunca çalışır.
+
+**Gerekli GitHub Secrets:**
+
+```
+GitHub → Repository → Settings → Secrets and variables → Actions → New repository secret
+```
+
+| Secret | Değer | Açıklama |
+|--------|-------|----------|
+| `AIRFLOW_HOST` | `192.168.x.x` | Airflow sunucusu IP |
+| `AIRFLOW_SSH_KEY` | `-----BEGIN...` | SSH private key |
+| `AIRFLOW_USER` | `yeliz` | SSH kullanıcı adı |
+| `AIRFLOW_DAGS_PATH` | `/home/.../dags` | Airflow dags klasörü yolu |
+| `AIRFLOW_API_URL` | `http://...:8080` | Airflow REST API |
+| `AIRFLOW_API_USER` | `admin` | Airflow kullanıcı adı |
+| `AIRFLOW_API_PASS` | `admin` | Airflow şifresi |
+| `TEAMS_WEBHOOK_URL` | `https://...` | Deployment bildirimi (opsiyonel) |
+
+---
+
+### Windows Yerel Deploy (CD Alternatifi)
+
+SSH ile CD kurmak yerine PowerShell script'ini kullanabilirsin:
+
+```powershell
+# Sadece değişen dosyaları kopyala
+.\tools\deploy_local.ps1
+
+# Önce ne yapacağını gör (kopyalamaz)
+.\tools\deploy_local.ps1 -DryRun
+
+# Sadece operatörleri kopyala
+.\tools\deploy_local.ps1 -OnlyOperators
+
+# Kopyala + Docker'ı yeniden başlat
+.\tools\deploy_local.ps1 -RestartDocker
+
+# Özel hedef yol
+.\tools\deploy_local.ps1 -AirflowDagsPath "D:\airflow\dags"
+```
+
+Script özellikleri:
+- MD5 hash karşılaştırması — değişmeyen dosyaları atlar
+- Deploy manifest (`VCE_DEPLOY_MANIFEST.txt`) oluşturur
+- `-DryRun` ile güvenli ön kontrol
+- Renkli terminal çıktısı
+
+---
+
+### Araçlar ve Konfigürasyon
+
+| Dosya | Araç | Amaç |
+|-------|------|------|
+| `pyproject.toml` | black, isort, pytest, coverage | Tüm araç konfigürasyonu |
+| `.sqlfluff` | sqlfluff | SQL lint kuralları |
+| `.github/workflows/ci.yml` | GitHub Actions | CI pipeline |
+| `.github/workflows/cd.yml` | GitHub Actions | CD pipeline |
+| `tools/deploy_local.ps1` | PowerShell | Windows yerel deploy |
+
+**Lokal araçları kur:**
+
+```bash
+pip install flake8 black isort bandit detect-secrets sqlfluff
+pip install pytest pytest-mock pytest-cov
+```
+
+**Lokal CI simülasyonu:**
+
+```bash
+# Lint
+flake8 operators/ dags/ --max-line-length=120
+black --check operators/ dags/
+
+# Testler
+pytest tests/ -v --cov=operators --cov-report=term-missing
+
+# SQL kontrolü
+sqlfluff lint sql/ --dialect mysql
+
+# DAG import
+python3 -c "import sys; sys.path.insert(0,'.'); import dags.mailsender_vce_main"
 ```
 
